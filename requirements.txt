@@ -1,0 +1,8 @@
+langgraph
+langchain
+langchain-openai
+linkup-sdk
+python-pptx
+pydantic
+python-dotenv
+pytrends
