@@ -2,13 +2,19 @@ import json
 import io
 import os
 import time
+import base64
 from contextlib import redirect_stdout
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+from urllib.parse import quote_plus
+from urllib.request import Request, urlopen
 from urllib.parse import urlparse
 
 from linkup import LinkupClient
 from pptx import Presentation
+from pptx.dml.color import RGBColor
+from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE
+from pptx.util import Inches, Pt
 
 
 class MarketSearchTool:
@@ -284,18 +290,37 @@ class ScenarioAnalysisTool:
 
 
 def generate_pitch_deck(slides: Dict[str, str], output_path: str) -> str:
-    """Create a .pptx deck from text content."""
+    """Create a styled .pptx deck from text content with optional visual enrichment."""
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    image_dir = path.parent / "images"
+    image_dir.mkdir(parents=True, exist_ok=True)
 
     prs = Presentation()
+    prs.slide_width = Inches(13.333)
+    prs.slide_height = Inches(7.5)
 
     title_layout = prs.slide_layouts[0]
     body_layout = prs.slide_layouts[1]
 
     title_slide = prs.slides.add_slide(title_layout)
+    _apply_background(title_slide, RGBColor(17, 24, 39), RGBColor(31, 41, 55))
     title_slide.shapes.title.text = slides.get("title", "Startup Pitch")
+    title_slide.shapes.title.text_frame.paragraphs[0].font.size = Pt(44)
+    title_slide.shapes.title.text_frame.paragraphs[0].font.bold = True
+    title_slide.shapes.title.text_frame.paragraphs[0].font.color.rgb = RGBColor(245, 245, 245)
     title_slide.placeholders[1].text = slides.get("subtitle", "AI Startup Pitch Refinery")
+    subtitle_p = title_slide.placeholders[1].text_frame.paragraphs[0]
+    subtitle_p.font.size = Pt(22)
+    subtitle_p.font.color.rgb = RGBColor(209, 213, 219)
+
+    # Accent stripe for title slide
+    stripe = title_slide.shapes.add_shape(
+        MSO_AUTO_SHAPE_TYPE.RECTANGLE, Inches(0), Inches(6.8), Inches(13.333), Inches(0.7)
+    )
+    stripe.fill.solid()
+    stripe.fill.fore_color.rgb = RGBColor(59, 130, 246)
+    stripe.line.fill.background()
 
     ordered_sections: List[str] = [
         "problem",
@@ -315,10 +340,205 @@ def generate_pitch_deck(slides: Dict[str, str], output_path: str) -> str:
         "financials": "Financials",
     }
 
-    for key in ordered_sections:
+    for idx, key in enumerate(ordered_sections):
         slide = prs.slides.add_slide(body_layout)
-        slide.shapes.title.text = headers[key]
-        slide.placeholders[1].text = slides.get(key, "TBD")
+        # Remove default content placeholder to avoid leftover bullet textbox artifacts.
+        if len(slide.placeholders) > 1:
+            ph = slide.placeholders[1]
+            ph_el = ph._element
+            ph_el.getparent().remove(ph_el)
+        section_text = slides.get(key, "TBD")
+        accent_color = _section_color(idx)
+        _apply_background(slide, RGBColor(249, 250, 251), RGBColor(243, 244, 246))
+        _style_section_title(slide, headers[key], accent_color)
+
+        # Remove default body placeholder text and draw custom content blocks.
+        content_box = slide.shapes.add_shape(
+            MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, Inches(0.7), Inches(1.5), Inches(7.3), Inches(5.3)
+        )
+        content_box.fill.solid()
+        content_box.fill.fore_color.rgb = RGBColor(255, 255, 255)
+        content_box.fill.transparency = 0.08
+        content_box.line.color.rgb = RGBColor(229, 231, 235)
+        content_box.line.width = Pt(1.5)
+
+        _fill_content_text(content_box.text_frame, section_text)
+
+        image_query = f"{headers[key]} startup business"
+        image_path = _fetch_slide_image(image_query, image_dir / f"{key}.jpg")
+
+        image_left = Inches(8.3)
+        image_top = Inches(1.55)
+        image_width = Inches(4.2)
+        image_height = Inches(5.2)
+        if image_path:
+            _add_picture_contain(
+                slide,
+                str(image_path),
+                image_left,
+                image_top,
+                image_width,
+                image_height,
+            )
+        else:
+            # Fallback decorative card when image fetch fails.
+            fallback = slide.shapes.add_shape(
+                MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, image_left, image_top, image_width, image_height
+            )
+            fallback.fill.solid()
+            fallback.fill.fore_color.rgb = RGBColor(224, 231, 255)
+            fallback.line.color.rgb = accent_color
+            fallback_text = fallback.text_frame
+            fallback_text.text = "Visual Placeholder"
+            fallback_text.paragraphs[0].font.bold = True
+            fallback_text.paragraphs[0].font.size = Pt(18)
+            fallback_text.paragraphs[0].font.color.rgb = RGBColor(55, 65, 81)
 
     prs.save(path)
     return str(path)
+
+
+def _section_color(idx: int) -> RGBColor:
+    palette = [
+        RGBColor(37, 99, 235),
+        RGBColor(16, 185, 129),
+        RGBColor(249, 115, 22),
+        RGBColor(168, 85, 247),
+        RGBColor(244, 63, 94),
+        RGBColor(14, 165, 233),
+    ]
+    return palette[idx % len(palette)]
+
+
+def _apply_background(slide, top: RGBColor, bottom: RGBColor) -> None:
+    # Use slide background fill so title/content placeholders remain on top.
+    fill = slide.background.fill
+    fill.solid()
+    fill.fore_color.rgb = top
+
+
+def _style_section_title(slide, title: str, accent: RGBColor) -> None:
+    title_shape = slide.shapes.title
+    title_shape.text = title
+    p = title_shape.text_frame.paragraphs[0]
+    p.font.size = Pt(36)
+    p.font.bold = True
+    p.font.color.rgb = RGBColor(17, 24, 39)
+
+    accent_bar = slide.shapes.add_shape(
+        MSO_AUTO_SHAPE_TYPE.RECTANGLE, Inches(0.7), Inches(1.2), Inches(2.2), Inches(0.08)
+    )
+    accent_bar.fill.solid()
+    accent_bar.fill.fore_color.rgb = accent
+    accent_bar.line.fill.background()
+
+
+def _fill_content_text(text_frame, content: str) -> None:
+    text_frame.clear()
+    lines = [ln.strip() for ln in content.split("\n") if ln.strip()]
+    if not lines:
+        lines = ["TBD"]
+    first = text_frame.paragraphs[0]
+    first.text = lines[0]
+    first.font.size = Pt(20)
+    first.font.bold = True
+    first.font.color.rgb = RGBColor(17, 24, 39)
+    for line in lines[1:]:
+        p = text_frame.add_paragraph()
+        p.text = line
+        p.level = 1
+        p.font.size = Pt(16)
+        p.font.color.rgb = RGBColor(55, 65, 81)
+
+
+def _add_picture_contain(slide, image_path: str, left, top, width, height) -> None:
+    """Place image inside target box without distortion and centered."""
+    # Start with native image dimensions.
+    pic = slide.shapes.add_picture(image_path, left, top)
+    iw, ih = float(pic.width), float(pic.height)
+    bw, bh = float(width), float(height)
+    if iw <= 0 or ih <= 0:
+        return
+
+    scale = min(bw / iw, bh / ih)
+    new_w = int(iw * scale)
+    new_h = int(ih * scale)
+    pic.width = new_w
+    pic.height = new_h
+    pic.left = int(float(left) + (bw - new_w) / 2)
+    pic.top = int(float(top) + (bh - new_h) / 2)
+
+
+def _fetch_slide_image(query: str, destination: Path) -> Optional[Path]:
+    provider = os.getenv("IMAGE_PROVIDER", "auto").strip().lower()
+    providers = [provider]
+    if provider == "auto":
+        # Prefer keyless stock source before paid generation.
+        providers = ["unsplash", "openai"]
+
+    for p in providers:
+        if p == "openai":
+            got = _fetch_from_openai_image(query, destination)
+        else:
+            got = _fetch_from_unsplash(query, destination)
+        if got:
+            return got
+    return None
+
+
+def _download_image(url: str, destination: Path, headers: Optional[Dict[str, str]] = None) -> Optional[Path]:
+    try:
+        req = Request(url, headers=headers or {"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=20) as resp:  # noqa: S310
+            content_type = str(resp.headers.get("Content-Type", "")).lower()
+            if "image" not in content_type:
+                return None
+            data = resp.read()
+        if not data:
+            return None
+        destination.write_bytes(data)
+        return destination
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _fetch_from_unsplash(query: str, destination: Path) -> Optional[Path]:
+    # Keyless random image endpoint.
+    url = f"https://source.unsplash.com/1600x900/?{quote_plus(query)}"
+    return _download_image(url, destination)
+
+
+def _fetch_from_openai_image(query: str, destination: Path) -> Optional[Path]:
+    enabled = os.getenv("OPENAI_IMAGE_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
+    if not enabled:
+        return None
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return None
+
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key)
+        model = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1").strip()
+        size = os.getenv("OPENAI_IMAGE_SIZE", "1536x1024").strip()
+        quality = os.getenv("OPENAI_IMAGE_QUALITY", "low").strip()
+        resp = client.images.generate(
+            model=model,
+            prompt=f"Professional business presentation image: {query}. Clean composition, no text.",
+            size=size,
+            quality=quality,
+        )
+        if not resp.data:
+            return None
+        first = resp.data[0]
+        b64 = getattr(first, "b64_json", None)
+        if b64:
+            destination.write_bytes(base64.b64decode(b64))
+            return destination
+        img_url = getattr(first, "url", None)
+        if img_url:
+            return _download_image(img_url, destination)
+        return None
+    except Exception:  # noqa: BLE001
+        return None

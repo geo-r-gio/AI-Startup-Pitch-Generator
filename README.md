@@ -38,6 +38,7 @@ Multi-agent LangGraph system that converts a rough startup idea into:
 6. Pitch Deck Generator Agent
 - Role: slide synthesis and `.pptx` generation
 - Tools: `python-pptx` + LLM
+- Notes: Applies styled layouts, backgrounds, accent elements, and optional per-slide imagery (with fallback placeholders).
 
 Toolsets are intentionally non-identical.
 
@@ -72,6 +73,11 @@ cp .env.example .env
 # GOOGLE_TRENDS_BACKOFF_FACTOR=0.4         # optional
 # GOOGLE_TRENDS_MAX_KEYWORDS=5             # optional
 # DISABLE_TRENDS=0                         # optional (set 1 to skip Google Trends)
+# IMAGE_PROVIDER=auto                      # auto | unsplash | openai
+# OPENAI_IMAGE_ENABLED=0                   # set 1 to enable generated images (paid)
+# OPENAI_IMAGE_MODEL=gpt-image-1           # optional
+# OPENAI_IMAGE_SIZE=1536x1024              # optional
+# OPENAI_IMAGE_QUALITY=low                 # optional (low/medium/high)
 # Optional quality controls:
 # LINKUP_ALLOWED_DOMAINS=imarcgroup.com,technavio.com,marketsandmarkets.com
 # LINKUP_BLOCKED_DOMAINS=github.com,marketreportsworld.com
