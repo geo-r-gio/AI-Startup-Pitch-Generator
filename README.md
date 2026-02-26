@@ -50,13 +50,20 @@ Toolsets are intentionally non-identical.
 
 ## Setup
 
-1. Install dependencies:
+1. Create and activate a virtual environment:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+2. Install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-2. Set environment variables:
+3. Set environment variables:
 
 ```bash
 cp .env.example .env
@@ -74,6 +81,8 @@ cp .env.example .env
 # GOOGLE_TRENDS_MAX_KEYWORDS=5             # optional
 # DISABLE_TRENDS=0                         # optional (set 1 to skip Google Trends)
 # IMAGE_PROVIDER=auto                      # auto | unsplash | openai
+# IMAGE_FETCH_ENABLED=1                    # set 0 to skip new image fetch/generation
+# IMAGE_REUSE_CACHE=1                      # set 1 to reuse output/images/*.jpg when present
 # OPENAI_IMAGE_ENABLED=0                   # set 1 to enable generated images (paid)
 # OPENAI_IMAGE_MODEL=gpt-image-1           # optional
 # OPENAI_IMAGE_SIZE=1536x1024              # optional
@@ -86,25 +95,31 @@ cp .env.example .env
 ## Run
 
 ```bash
-python main.py --idea "An app that helps students study better"
+.venv/bin/python main.py --idea "An app that helps students study better"
 ```
 
 Optional:
 
 ```bash
-python main.py --idea "AI coach for job interviews" --model "gpt-4.1-nano" --temperature 0 --seed 42 --thread-id run-001 --validation-threshold 75 --max-validation-retries 1 --save-json output/final_state.json
+.venv/bin/python main.py --idea "AI coach for job interviews" --model "gpt-4.1-nano" --temperature 0 --seed 42 --thread-id run-001 --validation-threshold 75 --max-validation-retries 1 --save-json output/final_state.json
 ```
 
 Skip trends when blocked/rate-limited:
 
 ```bash
-python main.py --idea "AI coach for job interviews" --disable-trends
+.venv/bin/python main.py --idea "AI coach for job interviews" --disable-trends
 ```
 
 Fail run when validation stays low:
 
 ```bash
-python main.py --idea "AI coach for job interviews" --fail-on-low-validation --validation-threshold 75
+.venv/bin/python main.py --idea "AI coach for job interviews" --fail-on-low-validation --validation-threshold 75
+```
+
+Force fresh slide images (do not reuse cache):
+
+```bash
+.venv/bin/python main.py --idea "AI coach for job interviews" --disable-image-cache
 ```
 
 ## Output

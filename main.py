@@ -49,6 +49,16 @@ def main() -> None:
         help="Skip Google Trends calls (useful if blocked/rate-limited).",
     )
     parser.add_argument(
+        "--disable-image-fetch",
+        action="store_true",
+        help="Do not fetch/generate new slide images; reuse cached images if available.",
+    )
+    parser.add_argument(
+        "--disable-image-cache",
+        action="store_true",
+        help="Do not reuse cached slide images; fetch/generate fresh images when possible.",
+    )
+    parser.add_argument(
         "--thread-id",
         type=str,
         default="default-thread",
@@ -85,6 +95,35 @@ def main() -> None:
         "yes",
         "on",
     }
+    env_disable_image_fetch = os.getenv("IMAGE_FETCH_ENABLED", "1").strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    env_disable_image_cache = os.getenv("IMAGE_REUSE_CACHE", "1").strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    if args.disable_image_fetch or env_disable_image_fetch:
+        os.environ["IMAGE_FETCH_ENABLED"] = "0"
+    if args.disable_image_cache or env_disable_image_cache:
+        os.environ["IMAGE_REUSE_CACHE"] = "0"
+
+    fetch_enabled = os.getenv("IMAGE_FETCH_ENABLED", "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    reuse_cache = os.getenv("IMAGE_REUSE_CACHE", "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
     app = StartupPitchRefinery(
         model=args.model,
@@ -105,6 +144,10 @@ def main() -> None:
     save_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
     print("\n=== Task Plan ===")
+    print(
+        f"(Image config: fetch={'on' if fetch_enabled else 'off'}, "
+        f"cache={'on' if reuse_cache else 'off'})"
+    )
     for step in state.get("task_plan", []):
         print(f"- {step}")
 

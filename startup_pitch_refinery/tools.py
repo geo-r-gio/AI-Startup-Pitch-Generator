@@ -40,7 +40,7 @@ class MarketSearchTool:
         self._blocked_domains = blocked_domains or default_blocked
         try:
             self._client = LinkupClient()
-        except Exception:  # noqa: BLE001
+        except Exception:  
             self._client = None
 
     @staticmethod
@@ -51,7 +51,7 @@ class MarketSearchTool:
             if domain.startswith("www."):
                 domain = domain[4:]
             return domain
-        except Exception:  # noqa: BLE001
+        except Exception:  
             return ""
 
     def _is_domain_allowed(self, domain: str) -> bool:
@@ -117,7 +117,7 @@ class MarketSearchTool:
                 "dropped_sources": dropped_count,
                 "error": "",
             }
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  
             return {
                 "status": "error",
                 "query": query,
@@ -139,7 +139,7 @@ class BusinessCalcTool:
             with redirect_stdout(buf):
                 exec(code, globals_dict, {})
             return buf.getvalue().strip()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  
             return f"Python calc failed: {exc}"
 
 
@@ -167,7 +167,7 @@ class GoogleTrendsTool:
                 retries=self.retries,
                 backoff_factor=self.backoff_factor,
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  
             self._client = None
             self._init_error = str(exc)
 
@@ -234,7 +234,7 @@ class GoogleTrendsTool:
                     per_keyword[kw] = summary
                     last_error = ""
                     break
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:  
                     last_error = str(exc)
                     if attempt < attempts - 1:
                         sleep_s = self.backoff_factor * (2**attempt)
@@ -342,7 +342,6 @@ def generate_pitch_deck(slides: Dict[str, str], output_path: str) -> str:
 
     for idx, key in enumerate(ordered_sections):
         slide = prs.slides.add_slide(body_layout)
-        # Remove default content placeholder to avoid leftover bullet textbox artifacts.
         if len(slide.placeholders) > 1:
             ph = slide.placeholders[1]
             ph_el = ph._element
@@ -352,7 +351,6 @@ def generate_pitch_deck(slides: Dict[str, str], output_path: str) -> str:
         _apply_background(slide, RGBColor(249, 250, 251), RGBColor(243, 244, 246))
         _style_section_title(slide, headers[key], accent_color)
 
-        # Remove default body placeholder text and draw custom content blocks.
         content_box = slide.shapes.add_shape(
             MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, Inches(0.7), Inches(1.5), Inches(7.3), Inches(5.3)
         )
@@ -381,7 +379,6 @@ def generate_pitch_deck(slides: Dict[str, str], output_path: str) -> str:
                 image_height,
             )
         else:
-            # Fallback decorative card when image fetch fails.
             fallback = slide.shapes.add_shape(
                 MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, image_left, image_top, image_width, image_height
             )
@@ -411,7 +408,6 @@ def _section_color(idx: int) -> RGBColor:
 
 
 def _apply_background(slide, top: RGBColor, bottom: RGBColor) -> None:
-    # Use slide background fill so title/content placeholders remain on top.
     fill = slide.background.fill
     fill.solid()
     fill.fore_color.rgb = top
@@ -453,7 +449,6 @@ def _fill_content_text(text_frame, content: str) -> None:
 
 def _add_picture_contain(slide, image_path: str, left, top, width, height) -> None:
     """Place image inside target box without distortion and centered."""
-    # Start with native image dimensions.
     pic = slide.shapes.add_picture(image_path, left, top)
     iw, ih = float(pic.width), float(pic.height)
     bw, bh = float(width), float(height)
@@ -470,10 +465,21 @@ def _add_picture_contain(slide, image_path: str, left, top, width, height) -> No
 
 
 def _fetch_slide_image(query: str, destination: Path) -> Optional[Path]:
+    reuse_cache = os.getenv("IMAGE_REUSE_CACHE", "1").strip().lower() in {"1", "true", "yes", "on"}
+    fetch_enabled = os.getenv("IMAGE_FETCH_ENABLED", "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if reuse_cache and destination.exists():
+        return destination
+    if not fetch_enabled:
+        return destination if destination.exists() else None
+
     provider = os.getenv("IMAGE_PROVIDER", "auto").strip().lower()
     providers = [provider]
     if provider == "auto":
-        # Prefer keyless stock source before paid generation.
         providers = ["unsplash", "openai"]
 
     for p in providers:
@@ -498,12 +504,11 @@ def _download_image(url: str, destination: Path, headers: Optional[Dict[str, str
             return None
         destination.write_bytes(data)
         return destination
-    except Exception:  # noqa: BLE001
+    except Exception:  
         return None
 
 
 def _fetch_from_unsplash(query: str, destination: Path) -> Optional[Path]:
-    # Keyless random image endpoint.
     url = f"https://source.unsplash.com/1600x900/?{quote_plus(query)}"
     return _download_image(url, destination)
 
@@ -540,5 +545,5 @@ def _fetch_from_openai_image(query: str, destination: Path) -> Optional[Path]:
         if img_url:
             return _download_image(img_url, destination)
         return None
-    except Exception:  # noqa: BLE001
+    except Exception:  
         return None
