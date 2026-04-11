@@ -101,8 +101,25 @@ cp .env.example .env
 Optional:
 
 ```bash
-.venv/bin/python main.py --idea "AI coach for job interviews" --model "gpt-4.1-nano" --temperature 0 --seed 42 --thread-id run-001 --validation-threshold 75 --max-validation-retries 1 --save-json output/final_state.json
+.venv/bin/python main.py --idea "AI coach for job interviews" --controller-policy adaptive --model "gpt-4.1-nano" --temperature 0 --seed 42 --thread-id run-001 --validation-threshold 75 --max-validation-retries 1 --save-json output/final_state.json
 ```
+
+Methodology comparison mode (single-agent baseline vs fixed/adaptive multi-agent):
+
+```bash
+.venv/bin/python main.py \
+  --mode compare \
+  --idea "AI coach for job interviews" \
+  --compare-strategies "single_agent,multi_agent,adaptive_controller" \
+  --compare-runs 3 \
+  --thread-id methodology-run \
+  --compare-output output/methodology_comparison.json
+```
+
+Notes:
+- `--compare-runs` repeats each strategy to reduce variance.
+- `--compare-generate-ppt` is optional and slower; compare mode defaults to metrics-first.
+- Comparison report includes run-level metrics (reliability, latency, source count, token proxy, retries, realized decomposition depth) and strategy-level aggregates.
 
 Skip trends when blocked/rate-limited:
 
@@ -125,6 +142,7 @@ Force fresh slide images (do not reuse cache):
 ## Output
 
 - Structured state JSON at `output/final_state.json`
+- Methodology comparison report at `output/methodology_comparison.json` (when `--mode compare`)
 - Pitch deck at `output/pitch_<idea_slug>.pptx`
 - Captured market source links in `market_sources`
 - Captured trend API payload in `trend_signals`
@@ -140,3 +158,4 @@ Force fresh slide images (do not reuse cache):
 - `startup_pitch_refinery/tools.py`: web search, calculator, pptx generator tools
 - `startup_pitch_refinery/agents.py`: specialized agents
 - `startup_pitch_refinery/graph.py`: LangGraph orchestration
+- `startup_pitch_refinery/methodology.py`: baseline/multi-agent comparison runner and metric aggregation

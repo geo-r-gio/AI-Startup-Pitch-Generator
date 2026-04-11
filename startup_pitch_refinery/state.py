@@ -5,6 +5,13 @@ from pydantic import BaseModel, Field
 
 class PitchState(BaseModel):
     idea: str
+    controller_policy: str = "fixed"
+    controller_mode: Optional[str] = None
+    controller_confidence: Optional[float] = None
+    controller_rationale: Optional[str] = None
+    controller_decisions: List[Dict[str, Any]] = Field(default_factory=list)
+    decomposition_depth_target: Optional[int] = None
+    decomposition_depth_realized: Optional[int] = None
     task_plan: Optional[List[str]] = None
     refined_idea: Optional[str] = None
     market_analysis: Optional[str] = None

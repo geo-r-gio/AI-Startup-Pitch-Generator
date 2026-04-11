@@ -6,6 +6,10 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from startup_pitch_refinery.graph import StartupPitchRefinery
+from startup_pitch_refinery.methodology import (
+    run_methodology_comparison,
+    save_methodology_report,
+)
 
 
 def main() -> None:
@@ -19,6 +23,18 @@ def main() -> None:
         type=str,
         required=True,
         help='Raw startup idea. Example: "An app that helps students study better"',
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["run", "compare"],
+        default="run",
+        help="`run`: execute standard multi-agent workflow. `compare`: run methodology strategy comparison.",
+    )
+    parser.add_argument(
+        "--controller-policy",
+        choices=["fixed", "adaptive"],
+        default="fixed",
+        help="Controller policy for run mode. `fixed` uses static workflow, `adaptive` chooses direct/shallow/recursive.",
     )
     parser.add_argument(
         "--model",
@@ -87,6 +103,29 @@ def main() -> None:
         default="output/final_state.json",
         help="Where to save full structured state",
     )
+    parser.add_argument(
+        "--compare-runs",
+        type=int,
+        default=1,
+        help="Number of repeated runs per strategy in compare mode.",
+    )
+    parser.add_argument(
+        "--compare-strategies",
+        type=str,
+        default="single_agent,multi_agent,adaptive_controller",
+        help="Comma-separated strategies for compare mode. Allowed: single_agent,multi_agent,adaptive_controller",
+    )
+    parser.add_argument(
+        "--compare-output",
+        type=str,
+        default="output/methodology_comparison.json",
+        help="Where to save compare-mode report JSON.",
+    )
+    parser.add_argument(
+        "--compare-generate-ppt",
+        action="store_true",
+        help="Generate pptx files during compare mode (slower).",
+    )
 
     args = parser.parse_args()
     env_disable_trends = os.getenv("DISABLE_TRENDS", "0").strip().lower() in {
@@ -125,12 +164,65 @@ def main() -> None:
         "on",
     }
 
+    if args.mode == "compare":
+        strategy_list = [
+            s.strip() for s in args.compare_strategies.split(",") if s.strip()
+        ]
+        report = run_methodology_comparison(
+            idea=args.idea,
+            model=args.model,
+            temperature=args.temperature,
+            seed=args.seed,
+            strict_tools=not args.no_strict_tools,
+            enable_trends=not (args.disable_trends or env_disable_trends),
+            compare_runs=max(1, args.compare_runs),
+            strategies=strategy_list,
+            validation_threshold=args.validation_threshold,
+            max_validation_retries=args.max_validation_retries,
+            generate_ppt=args.compare_generate_ppt,
+            thread_prefix=args.thread_id,
+        )
+        compare_saved = save_methodology_report(report, args.compare_output)
+
+        print("\n=== Methodology Comparison ===")
+        print(
+            f"(Image config: fetch={'on' if fetch_enabled else 'off'}, "
+            f"cache={'on' if reuse_cache else 'off'})"
+        )
+        print(f"Idea: {report['metadata']['idea']}")
+        print(f"Strategies: {', '.join(report['metadata']['strategies'])}")
+        print(f"Runs per strategy: {report['metadata']['compare_runs']}")
+        print("\n=== Aggregate Metrics ===")
+        aggregate = report.get("aggregate", {})
+        if not aggregate:
+            print("(no aggregate metrics)")
+        for strategy, stats in aggregate.items():
+            print(
+                f"- {strategy}: "
+                f"reliability_mean={stats.get('reliability_score_mean')}, "
+                f"runtime_mean_s={stats.get('runtime_seconds_mean')}, "
+                f"token_proxy_mean={stats.get('token_proxy_total_mean')}, "
+                f"supported_ratio_mean={stats.get('supported_ratio_mean')}, "
+                f"sources_mean={stats.get('market_sources_count_mean')}, "
+                f"depth_mean={stats.get('decomposition_depth_realized_mean')}"
+            )
+        print("\n=== Recommendation ===")
+        rec = report.get("recommendation")
+        if rec:
+            print(f"Best Strategy: {rec.get('best_strategy')}")
+            print(f"Rule: {rec.get('selection_rule')}")
+        else:
+            print("(no recommendation)")
+        print(f"\nComparison report saved to: {compare_saved}")
+        return
+
     app = StartupPitchRefinery(
         model=args.model,
         temperature=args.temperature,
         seed=args.seed,
         strict_tools=not args.no_strict_tools,
         enable_trends=not (args.disable_trends or env_disable_trends),
+        controller_policy=args.controller_policy,
     )
     state = app.run(
         idea=args.idea,
@@ -148,8 +240,21 @@ def main() -> None:
         f"(Image config: fetch={'on' if fetch_enabled else 'off'}, "
         f"cache={'on' if reuse_cache else 'off'})"
     )
+    print(f"(Controller policy: {args.controller_policy})")
     for step in state.get("task_plan", []):
         print(f"- {step}")
+
+    print("\n=== Controller Decision ===")
+    if state.get("controller_mode"):
+        print(
+            f"Mode: {state.get('controller_mode')} | "
+            f"Confidence: {state.get('controller_confidence')} | "
+            f"Target Depth: {state.get('decomposition_depth_target')} | "
+            f"Realized Depth: {state.get('decomposition_depth_realized')}"
+        )
+        print(f"Rationale: {state.get('controller_rationale', '')}")
+    else:
+        print("(controller node not active in this run)")
 
     print("\n=== Refined Idea ===")
     print(state.get("refined_idea", ""))
