@@ -226,6 +226,28 @@ class ValidationOutput(BaseModel):
     claims: List[VerifiedClaim]
 
 
+class ValidationRubricScores(BaseModel):
+    evidence_grounding: int = Field(..., ge=0, le=100)
+    source_credibility: int = Field(..., ge=0, le=100)
+    claim_specificity: int = Field(..., ge=0, le=100)
+    internal_consistency: int = Field(..., ge=0, le=100)
+
+
+class JudgeValidationOutput(BaseModel):
+    validated_summary: str
+    evidence_gaps: str
+    overall_reliability: int = Field(..., ge=0, le=100)
+    rubric_scores: ValidationRubricScores
+    claims: List[VerifiedClaim]
+
+
+class SecondJudgeOutput(BaseModel):
+    evidence_gaps: str
+    overall_reliability: int = Field(..., ge=0, le=100)
+    rubric_scores: ValidationRubricScores
+    claim_assessments: List[VerifiedClaim]
+
+
 class TrendKeywords(BaseModel):
     keywords: List[str] = Field(
         ...,
@@ -954,17 +976,24 @@ class MarketResearchAgent:
 
 class SourceValidatorAgent:
     def __init__(self, llm: ChatOpenAI):
-        self.structured_llm = llm.with_structured_output(ValidationOutput, include_raw=True)
-        self.prompt = ChatPromptTemplate.from_messages(
+        self.primary_judge_llm = llm.with_structured_output(
+            JudgeValidationOutput, include_raw=True
+        )
+        self.secondary_judge_llm = llm.with_structured_output(
+            SecondJudgeOutput, include_raw=True
+        )
+        self.primary_prompt = ChatPromptTemplate.from_messages(
             [
                 (
                     "system",
                     "# Role\n"
-                    "You are a source validation analyst.\n\n"
+                    "You are Judge A, a strict source validation analyst.\n\n"
                     "# Instructions\n"
                     "- Verify material market claims only against provided evidence snippets and URLs.\n"
                     "- Do not invent sources or unsupported claims.\n"
-                    "- Provide claim-level verdicts, confidence, rationale, and supporting sources.\n\n"
+                    "- Provide claim-level verdicts, confidence, rationale, and supporting sources.\n"
+                    "- Score rubric dimensions (0-100): evidence grounding, source credibility, claim specificity, internal consistency.\n"
+                    "- Provide overall reliability (0-100).\n\n"
                     "# Output Format\n"
                     "- Return content that strictly matches the structured schema fields.",
                 ),
@@ -977,44 +1006,263 @@ class SourceValidatorAgent:
                 ),
             ]
         )
+        self.secondary_prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    "# Role\n"
+                    "You are Judge B, an independent methodology-focused reviewer.\n\n"
+                    "# Instructions\n"
+                    "- Independently evaluate each provided claim against the same evidence.\n"
+                    "- Do not copy Judge A labels blindly; reassess verdict and confidence per claim.\n"
+                    "- Score rubric dimensions (0-100): evidence grounding, source credibility, claim specificity, internal consistency.\n"
+                    "- Provide overall reliability (0-100) and evidence gaps.\n\n"
+                    "# Output Format\n"
+                    "- Return content that strictly matches the structured schema fields.",
+                ),
+                (
+                    "human",
+                    "Startup concept:\n{refined_idea}\n\n"
+                    "Market analysis draft:\n{market_analysis}\n\n"
+                    "Evidence snippets (title/url/content):\n{market_evidence}\n\n"
+                    "Claims to evaluate:\n{claims_to_review}\n\n"
+                    "Return independent claim assessments and rubric scores.",
+                ),
+            ]
+        )
+
+    @staticmethod
+    def _rubric_mean(rubric: Dict[str, Any]) -> float:
+        keys = [
+            "evidence_grounding",
+            "source_credibility",
+            "claim_specificity",
+            "internal_consistency",
+        ]
+        vals: List[float] = []
+        for key in keys:
+            try:
+                vals.append(float(rubric.get(key, 0)))
+            except (TypeError, ValueError):
+                vals.append(0.0)
+        if not vals:
+            return 0.0
+        return sum(vals) / len(vals)
+
+    @staticmethod
+    def _clamp_score(value: float) -> int:
+        return int(max(0, min(100, round(value))))
+
+    @staticmethod
+    def _judge_summary(
+        report: Dict[str, Any],
+        det_score: int,
+        usage: Dict[str, int],
+    ) -> Dict[str, Any]:
+        return {
+            "overall_reliability": int(report.get("overall_reliability", 0) or 0),
+            "deterministic_claim_score": int(det_score),
+            "rubric_scores": dict(report.get("rubric_scores", {}) or {}),
+            "rubric_mean": round(
+                SourceValidatorAgent._rubric_mean(report.get("rubric_scores", {}) or {}),
+                3,
+            ),
+            "claim_count": len(report.get("claims", []) or report.get("claim_assessments", [])),
+            "token_usage": usage,
+        }
+
+    @staticmethod
+    def _agreement_stats(
+        primary_claims: List[Dict[str, Any]],
+        secondary_claims: List[Dict[str, Any]],
+        rubric_a: Dict[str, Any],
+        rubric_b: Dict[str, Any],
+        score_a: int,
+        score_b: int,
+    ) -> Dict[str, Any]:
+        rubric_dims = [
+            "evidence_grounding",
+            "source_credibility",
+            "claim_specificity",
+            "internal_consistency",
+        ]
+        rubric_diffs: Dict[str, float] = {}
+        for dim in rubric_dims:
+            va = float(rubric_a.get(dim, 0) or 0)
+            vb = float(rubric_b.get(dim, 0) or 0)
+            rubric_diffs[dim] = round(abs(va - vb), 3)
+
+        primary_map = {
+            str(c.get("claim", "")).strip().lower(): str(c.get("verdict", "")).strip().lower()
+            for c in primary_claims
+            if str(c.get("claim", "")).strip()
+        }
+        secondary_map = {
+            str(c.get("claim", "")).strip().lower(): str(c.get("verdict", "")).strip().lower()
+            for c in secondary_claims
+            if str(c.get("claim", "")).strip()
+        }
+        shared = sorted(set(primary_map.keys()) & set(secondary_map.keys()))
+        verdict_matches = 0
+        for key in shared:
+            if primary_map.get(key) == secondary_map.get(key):
+                verdict_matches += 1
+        verdict_agreement = (
+            round(verdict_matches / len(shared), 4) if shared else 0.0
+        )
+
+        score_delta = abs(int(score_a) - int(score_b))
+        score_agreement = round(max(0.0, 1.0 - (score_delta / 100.0)), 4)
+        rubric_mae = (
+            round(sum(rubric_diffs.values()) / max(1, len(rubric_diffs)), 4)
+            if rubric_diffs
+            else 0.0
+        )
+        rubric_agreement = round(max(0.0, 1.0 - (rubric_mae / 100.0)), 4)
+        overall_agreement = round(
+            (score_agreement + rubric_agreement + verdict_agreement) / 3.0, 4
+        )
+        return {
+            "score_delta_abs": score_delta,
+            "score_agreement": score_agreement,
+            "rubric_mae": rubric_mae,
+            "rubric_diffs": rubric_diffs,
+            "rubric_agreement": rubric_agreement,
+            "shared_claims": len(shared),
+            "verdict_agreement_rate": verdict_agreement,
+            "overall_agreement": overall_agreement,
+        }
 
     def run(self, state: PitchState) -> PitchState:
         evidence_json = json.dumps(_sget(state, "market_evidence", []), indent=2)
-        result, usage = _invoke_structured_with_usage(
-            self.structured_llm,
-            self.prompt.format_messages(
+        primary_result, usage_primary = _invoke_structured_with_usage(
+            self.primary_judge_llm,
+            self.primary_prompt.format_messages(
                 refined_idea=_sget(state, "refined_idea", ""),
                 market_analysis=_sget(state, "market_analysis", ""),
                 market_evidence=evidence_json,
             ),
         )
-        token_usage = _merge_token_usage(state, usage)
-        report: Dict[str, Any] = json.loads(result.model_dump_json())
-        deterministic_score = _deterministic_reliability_score(report.get("claims", []))
-        report["reliability_score"] = deterministic_score
+        primary_report: Dict[str, Any] = json.loads(primary_result.model_dump_json())
+        primary_claims = primary_report.get("claims", [])
+        primary_det_score = _deterministic_reliability_score(primary_claims)
+        claims_for_secondary = json.dumps(
+            [{"claim": c.get("claim", "")} for c in primary_claims], indent=2
+        )
+
+        secondary_failed = False
+        usage_secondary = _empty_token_usage()
+        secondary_report: Dict[str, Any] = {}
+        try:
+            secondary_result, usage_secondary = _invoke_structured_with_usage(
+                self.secondary_judge_llm,
+                self.secondary_prompt.format_messages(
+                    refined_idea=_sget(state, "refined_idea", ""),
+                    market_analysis=_sget(state, "market_analysis", ""),
+                    market_evidence=evidence_json,
+                    claims_to_review=claims_for_secondary,
+                ),
+            )
+            secondary_report = json.loads(secondary_result.model_dump_json())
+        except Exception:  # noqa: BLE001
+            secondary_failed = True
+            # Fallback to primary output so pipeline remains robust.
+            secondary_report = {
+                "evidence_gaps": primary_report.get("evidence_gaps", ""),
+                "overall_reliability": int(primary_report.get("overall_reliability", 0) or 0),
+                "rubric_scores": dict(primary_report.get("rubric_scores", {}) or {}),
+                "claim_assessments": list(primary_claims),
+            }
+
+        secondary_claims = secondary_report.get("claim_assessments", [])
+        secondary_det_score = _deterministic_reliability_score(secondary_claims)
+        score_a = int(primary_report.get("overall_reliability", 0) or 0)
+        score_b = int(secondary_report.get("overall_reliability", 0) or 0)
+        rubric_a = dict(primary_report.get("rubric_scores", {}) or {})
+        rubric_b = dict(secondary_report.get("rubric_scores", {}) or {})
+
+        agreement = self._agreement_stats(
+            primary_claims=primary_claims,
+            secondary_claims=secondary_claims,
+            rubric_a=rubric_a,
+            rubric_b=rubric_b,
+            score_a=score_a,
+            score_b=score_b,
+        )
+        rubric_mean_a = self._rubric_mean(rubric_a)
+        rubric_mean_b = self._rubric_mean(rubric_b)
+        blended_score = (
+            0.35 * ((score_a + score_b) / 2.0)
+            + 0.35 * ((primary_det_score + secondary_det_score) / 2.0)
+            + 0.30 * ((rubric_mean_a + rubric_mean_b) / 2.0)
+        )
+        final_score = self._clamp_score(blended_score)
+
+        # Use primary claim list as canonical for downstream compatibility.
+        report: Dict[str, Any] = {
+            "validated_summary": primary_report.get("validated_summary", ""),
+            "evidence_gaps": primary_report.get("evidence_gaps", ""),
+            "claims": primary_claims,
+            "reliability_score": final_score,
+            "judge_scores": {
+                "judge_a": self._judge_summary(primary_report, primary_det_score, usage_primary),
+                "judge_b": self._judge_summary(
+                    {
+                        "overall_reliability": score_b,
+                        "rubric_scores": rubric_b,
+                        "claim_assessments": secondary_claims,
+                    },
+                    secondary_det_score,
+                    usage_secondary,
+                ),
+                "aggregated": {
+                    "final_reliability_score": final_score,
+                    "final_formula": (
+                        "0.35*avg(judge_overall) + 0.35*avg(deterministic_claim_score) + "
+                        "0.30*avg(rubric_mean)"
+                    ),
+                },
+            },
+            "agreement_stats": agreement,
+            "evaluation_primary": {
+                "used_for_decision": True,
+                "primary_reliability_score": final_score,
+                "primary_judge_agreement": agreement.get("overall_agreement"),
+                "decision_rule": (
+                    "needs_revision = primary_reliability_score < validation_threshold"
+                ),
+            },
+        }
+        total_usage = _merge_token_usage({"token_usage": usage_primary}, usage_secondary)
+        token_usage = _merge_token_usage(state, total_usage)
         validated = (
             f"{_sget(state, 'market_analysis', '')}\n\n"
-            f"Validation Score: {deterministic_score}/100\n"
-            f"Validated Summary: {result.validated_summary}\n"
-            f"Evidence Gaps: {result.evidence_gaps}"
+            f"Validation Score: {final_score}/100\n"
+            f"Validated Summary: {report.get('validated_summary', '')}\n"
+            f"Evidence Gaps: {report.get('evidence_gaps', '')}\n"
+            f"Judge Agreement: {agreement.get('overall_agreement')}"
         )
         tool_audit = list(_sget(state, "tool_audit", []))
         tool_audit.append(
             {
                 "agent": "source_validator",
-                "tool": "llm_claim_verifier",
+                "tool": "llm_claim_verifier_dual_judge",
                 "status": "ok",
                 "claims_checked": len(report.get("claims", [])),
-                "reliability_score": deterministic_score,
-                "prompt_tokens": usage.get("prompt_tokens", 0),
-                "completion_tokens": usage.get("completion_tokens", 0),
-                "total_tokens": usage.get("total_tokens", 0),
+                "reliability_score": final_score,
+                "judge_a_score": score_a,
+                "judge_b_score": score_b,
+                "judge_agreement": agreement.get("overall_agreement"),
+                "secondary_judge_fallback": secondary_failed,
+                "prompt_tokens": total_usage.get("prompt_tokens", 0),
+                "completion_tokens": total_usage.get("completion_tokens", 0),
+                "total_tokens": total_usage.get("total_tokens", 0),
             }
         )
         return {
             "validation_report": report,
             "validated_market_analysis": validated,
-            "needs_revision": deterministic_score < _sget(state, "validation_threshold", 70),
+            "needs_revision": final_score < _sget(state, "validation_threshold", 70),
             "tool_audit": tool_audit,
             "token_usage": token_usage,
         }

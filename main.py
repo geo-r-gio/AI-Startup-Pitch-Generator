@@ -12,6 +12,7 @@ from startup_pitch_refinery.graph import StartupPitchRefinery
 from startup_pitch_refinery.methodology import (
     run_methodology_batch_comparison,
     run_methodology_comparison,
+    save_paper_mode_exports,
     save_methodology_csvs,
     save_methodology_report,
 )
@@ -218,6 +219,23 @@ def main() -> None:
         help="Generate pptx files during compare mode (slower).",
     )
     parser.add_argument(
+        "--paper-mode",
+        action="store_true",
+        help="In compare mode, also export a minimal paper-ready metrics JSON + CSV.",
+    )
+    parser.add_argument(
+        "--paper-json-output",
+        type=str,
+        default="output/methodology_paper_report.json",
+        help="Path for paper-mode JSON export.",
+    )
+    parser.add_argument(
+        "--paper-csv-output",
+        type=str,
+        default="output/methodology_paper_runs.csv",
+        help="Path for paper-mode run-level CSV export.",
+    )
+    parser.add_argument(
         "--run-output-dir",
         type=str,
         default="",
@@ -276,6 +294,8 @@ def main() -> None:
     user_set_runs_csv = "--runs-csv-output" in sys.argv
     user_set_aggregate_csv = "--aggregate-csv-output" in sys.argv
     user_set_best_summary = "--best-summary-output" in sys.argv
+    user_set_paper_json = "--paper-json-output" in sys.argv
+    user_set_paper_csv = "--paper-csv-output" in sys.argv
 
     save_json_path = (
         Path(args.save_json)
@@ -301,6 +321,16 @@ def main() -> None:
         Path(args.best_summary_output)
         if user_set_best_summary
         else run_output_dir / "methodology_best_summary.json"
+    )
+    paper_json_path = (
+        Path(args.paper_json_output)
+        if user_set_paper_json
+        else run_output_dir / "methodology_paper_report.json"
+    )
+    paper_csv_path = (
+        Path(args.paper_csv_output)
+        if user_set_paper_csv
+        else run_output_dir / "methodology_paper_runs.csv"
     )
 
     if args.mode == "compare":
@@ -364,12 +394,19 @@ def main() -> None:
             )
         compare_saved = save_methodology_report(report, str(compare_output_path))
         csv_saved = None
+        paper_saved = None
         if args.compare_export_csv:
             csv_saved = save_methodology_csvs(
                 report=report,
                 run_csv_path=str(runs_csv_path),
                 aggregate_csv_path=str(aggregate_csv_path),
                 summary_json_path=str(best_summary_path),
+            )
+        if args.paper_mode:
+            paper_saved = save_paper_mode_exports(
+                report=report,
+                paper_json_path=str(paper_json_path),
+                paper_csv_path=str(paper_csv_path),
             )
 
         print("\n=== Methodology Comparison ===")
@@ -400,13 +437,11 @@ def main() -> None:
                 f"reliability_mean={stats.get('reliability_score_mean')}, "
                 f"runtime_mean_s={stats.get('runtime_seconds_mean')}, "
                 f"actual_tokens_mean={stats.get('actual_total_tokens_mean')}, "
-                f"token_proxy_mean={stats.get('token_proxy_total_mean')}, "
+                f"judge_agreement_mean={stats.get('judge_agreement_mean')}, "
                 f"rel_per_1k_actual_tok_mean={stats.get('reliability_per_1k_actual_token_mean')}, "
-                f"rel_per_1k_tok_mean={stats.get('reliability_per_1k_token_mean')}, "
                 f"supported_ratio_mean={stats.get('supported_ratio_mean')}, "
                 f"sources_mean={stats.get('market_sources_count_mean')}, "
                 f"depth_mean={stats.get('decomposition_depth_realized_mean')}, "
-                f"budget_override_mean={stats.get('controller_budget_override_mean')}, "
                 f"budget_hits_mean={stats.get('budget_hit_mean')}"
             )
         print("\n=== Recommendation ===")
@@ -427,6 +462,9 @@ def main() -> None:
                 f"{csv_saved['aggregate_csv_compact']}"
             )
             print(f"Best-summary JSON saved to: {csv_saved['summary_json']}")
+        if paper_saved:
+            print(f"Paper-mode JSON saved to: {paper_saved['paper_json']}")
+            print(f"Paper-mode CSV saved to: {paper_saved['paper_csv']}")
         return
 
     app = StartupPitchRefinery(
@@ -518,6 +556,14 @@ def main() -> None:
             f"Reliability Score: {validation.get('reliability_score', 'n/a')}/100 | "
             f"Evidence Gaps: {validation.get('evidence_gaps', '')}"
         )
+        agreement = validation.get("agreement_stats", {})
+        if agreement:
+            print(
+                "Judge Agreement: "
+                f"overall={agreement.get('overall_agreement')} | "
+                f"score_delta_abs={agreement.get('score_delta_abs')} | "
+                f"verdict_agreement={agreement.get('verdict_agreement_rate')}"
+            )
         claims = validation.get("claims", [])
         for idx, claim in enumerate(claims, start=1):
             print(

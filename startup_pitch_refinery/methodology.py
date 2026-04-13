@@ -128,57 +128,35 @@ def _extract_metrics(state: Dict[str, Any], strategy: str, runtime_seconds: floa
     budget_hit = bool(state.get("budget_hit", False))
     budget_violation_count = len(state.get("budget_hit_reasons", []) or [])
     reliability_score = _safe_int(validation.get("reliability_score", 0), 0)
-    token_proxy_total = _estimate_tokens_proxy(state)
     token_usage = state.get("token_usage", {}) or {}
     prompt_tokens_total = _safe_int(token_usage.get("prompt_tokens", 0), 0)
     completion_tokens_total = _safe_int(token_usage.get("completion_tokens", 0), 0)
     actual_total_tokens = _safe_int(token_usage.get("total_tokens", 0), 0)
-    reliability_per_1k_token = round(
-        (reliability_score * 1000.0) / max(1, token_proxy_total), 4
-    )
     reliability_per_1k_actual_token = round(
         (reliability_score * 1000.0) / max(1, actual_total_tokens), 4
     )
     reliability_per_second = round(
         reliability_score / max(0.001, float(runtime_seconds)), 4
     )
-    validator_scores = [
-        _safe_int(entry.get("reliability_score", 0), 0)
-        for entry in (state.get("tool_audit", []) or [])
-        if entry.get("agent") == "source_validator"
-        and entry.get("tool") == "llm_claim_verifier"
-    ]
-    retry_score_delta = 0
-    retry_effective = 0
-    if len(validator_scores) >= 2:
-        retry_score_delta = validator_scores[-1] - validator_scores[0]
-        retry_effective = 1 if retry_score_delta > 0 else 0
-
+    agreement_stats = validation.get("agreement_stats", {}) if isinstance(validation, dict) else {}
     metrics = {
         "strategy": strategy,
         "controller_mode": state.get("controller_mode", "n/a"),
-        "controller_budget_override": 1 if state.get("controller_budget_override", False) else 0,
         "runtime_seconds": round(runtime_seconds, 3),
         "reliability_score": reliability_score,
         "claims_total": len(validation.get("claims", []) if validation else []),
         "supported_ratio": ratios["supported_ratio"],
-        "weak_or_better_ratio": ratios["weak_or_better_ratio"],
         "market_sources_count": len(state.get("market_sources", [])),
         "tool_calls": len(state.get("tool_audit", [])),
         "retry_count": _safe_int(state.get("retry_count", 0), 0),
         "decomposition_depth_realized": _safe_int(state.get("decomposition_depth_realized", 0), 0),
-        "needs_revision": bool(state.get("needs_revision", False)),
-        "trend_status": (state.get("trend_signals") or {}).get("status", "unknown"),
         "prompt_tokens_total": prompt_tokens_total,
         "completion_tokens_total": completion_tokens_total,
         "actual_total_tokens": actual_total_tokens,
-        "token_proxy_total": token_proxy_total,
-        "reliability_per_1k_token": reliability_per_1k_token,
         "reliability_per_1k_actual_token": reliability_per_1k_actual_token,
         "reliability_per_second": reliability_per_second,
-        "validator_passes": len(validator_scores),
-        "retry_score_delta": retry_score_delta,
-        "retry_effective": retry_effective,
+        "judge_agreement": float(agreement_stats.get("overall_agreement", 0.0) or 0.0),
+        "judge_score_delta_abs": float(agreement_stats.get("score_delta_abs", 0.0) or 0.0),
         "budget_hit": 1 if budget_hit else 0,
         "budget_violation_count": budget_violation_count,
         "finished_under_budget": 0 if budget_hit else 1,
@@ -229,25 +207,20 @@ def _aggregate_metrics(records: List[Dict[str, Any]]) -> Dict[str, Dict[str, flo
         "runtime_seconds",
         "reliability_score",
         "supported_ratio",
-        "weak_or_better_ratio",
         "market_sources_count",
         "tool_calls",
         "retry_count",
         "decomposition_depth_realized",
-        "token_proxy_total",
         "prompt_tokens_total",
         "completion_tokens_total",
         "actual_total_tokens",
-        "reliability_per_1k_token",
         "reliability_per_1k_actual_token",
         "reliability_per_second",
-        "validator_passes",
-        "retry_score_delta",
-        "retry_effective",
+        "judge_agreement",
+        "judge_score_delta_abs",
         "reliability_gain_vs_single",
         "depth_delta_vs_single",
         "depth_vs_reliability_gain",
-        "controller_budget_override",
         "budget_hit",
         "budget_violation_count",
         "finished_under_budget",
@@ -754,13 +727,13 @@ def run_methodology_comparison(
                 kv[1].get("budget_violation_count_mean", float("inf")),
                 -kv[1].get("reliability_score_mean", 0.0),
                 kv[1].get("runtime_seconds_mean", float("inf")),
-                kv[1].get("token_proxy_total_mean", float("inf")),
+                kv[1].get("actual_total_tokens_mean", float("inf")),
             ),
         )
         best_name, best_stats = ranked[0]
         recommendation = {
             "best_strategy": best_name,
-            "selection_rule": "lowest budget violations, then highest mean reliability score, then lower runtime and token proxy",
+            "selection_rule": "lowest budget violations, then highest mean reliability score, then lower runtime and actual total tokens",
             "stats": best_stats,
         }
 
@@ -854,10 +827,11 @@ def save_methodology_csvs(
         "strategy",
         "controller_mode",
         "reliability_score",
+        "judge_agreement",
         "supported_ratio",
         "runtime_seconds",
         "actual_total_tokens",
-        "token_proxy_total",
+        "reliability_per_1k_actual_token",
         "tool_calls",
         "decomposition_depth_realized",
         "reliability_gain_vs_single",
@@ -873,7 +847,8 @@ def save_methodology_csvs(
         "reliability_score_mean",
         "runtime_seconds_mean",
         "actual_total_tokens_mean",
-        "token_proxy_total_mean",
+        "judge_agreement_mean",
+        "reliability_per_1k_actual_token_mean",
         "supported_ratio_mean",
         "decomposition_depth_realized_mean",
         "reliability_gain_vs_single_mean",
@@ -896,6 +871,111 @@ def save_methodology_csvs(
         "run_csv_compact": str(run_compact_path),
         "aggregate_csv_compact": str(agg_compact_path),
         "summary_json": str(summary_path),
+    }
+
+
+def save_paper_mode_exports(
+    report: Dict[str, Any],
+    paper_json_path: str,
+    paper_csv_path: str,
+) -> Dict[str, str]:
+    """
+    Save a minimal paper-ready view:
+    - run-level CSV with only core evaluation metrics
+    - JSON with compact aggregate + recommendation
+    """
+    json_path = Path(paper_json_path)
+    csv_path = Path(paper_csv_path)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+    run_rows = report.get("runs", [])
+    paper_columns = [
+        "idea_index",
+        "idea",
+        "run_index",
+        "strategy",
+        "controller_mode",
+        "reliability_score",
+        "judge_agreement",
+        "supported_ratio",
+        "runtime_seconds",
+        "actual_total_tokens",
+        "reliability_per_1k_actual_token",
+        "decomposition_depth_realized",
+        "budget_hit",
+    ]
+
+    paper_run_rows: List[Dict[str, Any]] = []
+    for row in run_rows:
+        metrics = row.get("metrics", {})
+        flat = {
+            "idea_index": row.get("idea_index", 0),
+            "idea": row.get("idea", report.get("metadata", {}).get("idea", "")),
+            "run_index": row.get("run_index"),
+            "strategy": row.get("strategy"),
+            "controller_mode": metrics.get("controller_mode", "n/a"),
+            "reliability_score": metrics.get("reliability_score", 0),
+            "judge_agreement": metrics.get("judge_agreement", 0.0),
+            "supported_ratio": metrics.get("supported_ratio", 0.0),
+            "runtime_seconds": metrics.get("runtime_seconds", 0.0),
+            "actual_total_tokens": metrics.get("actual_total_tokens", 0),
+            "reliability_per_1k_actual_token": metrics.get(
+                "reliability_per_1k_actual_token", 0.0
+            ),
+            "decomposition_depth_realized": metrics.get(
+                "decomposition_depth_realized", 0
+            ),
+            "budget_hit": metrics.get("budget_hit", 0),
+        }
+        paper_run_rows.append(flat)
+
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=paper_columns)
+        writer.writeheader()
+        for row in paper_run_rows:
+            writer.writerow(row)
+
+    agg = report.get("aggregate", {})
+    compact_aggregate: Dict[str, Dict[str, Any]] = {}
+    for strategy, stats in agg.items():
+        compact_aggregate[strategy] = {
+            "runs": stats.get("runs"),
+            "reliability_score_mean": stats.get("reliability_score_mean"),
+            "judge_agreement_mean": stats.get("judge_agreement_mean"),
+            "supported_ratio_mean": stats.get("supported_ratio_mean"),
+            "runtime_seconds_mean": stats.get("runtime_seconds_mean"),
+            "actual_total_tokens_mean": stats.get("actual_total_tokens_mean"),
+            "reliability_per_1k_actual_token_mean": stats.get(
+                "reliability_per_1k_actual_token_mean"
+            ),
+            "decomposition_depth_realized_mean": stats.get(
+                "decomposition_depth_realized_mean"
+            ),
+            "budget_hit_mean": stats.get("budget_hit_mean"),
+            "mode_distribution": stats.get("mode_distribution"),
+        }
+
+    paper_json = {
+        "metadata": report.get("metadata", {}),
+        "evaluation_primary_metrics": [
+            "reliability_score",
+            "judge_agreement",
+            "supported_ratio",
+            "runtime_seconds",
+            "actual_total_tokens",
+            "reliability_per_1k_actual_token",
+            "decomposition_depth_realized",
+            "budget_hit",
+        ],
+        "aggregate": compact_aggregate,
+        "recommendation": report.get("recommendation"),
+    }
+    json_path.write_text(json.dumps(paper_json, indent=2), encoding="utf-8")
+
+    return {
+        "paper_json": str(json_path),
+        "paper_csv": str(csv_path),
     }
 
 
@@ -972,13 +1052,13 @@ def run_methodology_batch_comparison(
                 kv[1].get("budget_violation_count_mean", float("inf")),
                 -kv[1].get("reliability_score_mean", 0.0),
                 kv[1].get("runtime_seconds_mean", float("inf")),
-                kv[1].get("token_proxy_total_mean", float("inf")),
+                kv[1].get("actual_total_tokens_mean", float("inf")),
             ),
         )
         best_name, best_stats = ranked[0]
         recommendation = {
             "best_strategy": best_name,
-            "selection_rule": "lowest budget violations, then highest mean reliability score, then lower runtime and token proxy",
+            "selection_rule": "lowest budget violations, then highest mean reliability score, then lower runtime and actual total tokens",
             "stats": best_stats,
         }
 
