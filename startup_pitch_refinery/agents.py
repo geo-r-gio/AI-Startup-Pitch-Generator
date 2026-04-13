@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Literal
+from typing import Any, Dict, List, Literal, Optional
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
@@ -23,6 +23,71 @@ def _sget(state: PitchState | Dict[str, Any], key: str, default: Any = None) -> 
     if isinstance(state, dict):
         return state.get(key, default)
     return getattr(state, key, default)
+
+
+def _empty_token_usage() -> Dict[str, int]:
+    return {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+    }
+
+
+def _extract_token_usage(raw_message: Any) -> Dict[str, int]:
+    usage = _empty_token_usage()
+    if raw_message is None:
+        return usage
+
+    usage_meta = getattr(raw_message, "usage_metadata", None) or {}
+    response_meta = getattr(raw_message, "response_metadata", None) or {}
+    token_usage = response_meta.get("token_usage", {}) if isinstance(response_meta, dict) else {}
+
+    prompt = (
+        usage_meta.get("input_tokens")
+        or usage_meta.get("prompt_tokens")
+        or token_usage.get("prompt_tokens")
+        or 0
+    )
+    completion = (
+        usage_meta.get("output_tokens")
+        or usage_meta.get("completion_tokens")
+        or token_usage.get("completion_tokens")
+        or 0
+    )
+    total = (
+        usage_meta.get("total_tokens")
+        or token_usage.get("total_tokens")
+        or (int(prompt) + int(completion))
+    )
+
+    usage["prompt_tokens"] = max(0, int(prompt))
+    usage["completion_tokens"] = max(0, int(completion))
+    usage["total_tokens"] = max(0, int(total))
+    return usage
+
+
+def _invoke_structured_with_usage(runnable: Any, messages: Any) -> tuple[Any, Dict[str, int]]:
+    payload = runnable.invoke(messages)
+    if isinstance(payload, dict) and "parsed" in payload:
+        parsed = payload.get("parsed")
+        if parsed is None:
+            raise ValueError(f"Structured output parsing failed: {payload.get('parsing_error')}")
+        usage = _extract_token_usage(payload.get("raw"))
+        return parsed, usage
+    return payload, _empty_token_usage()
+
+
+def _merge_token_usage(
+    state: PitchState | Dict[str, Any], usage_delta: Dict[str, int]
+) -> Dict[str, int]:
+    base = _sget(state, "token_usage", {}) or {}
+    merged = {
+        "prompt_tokens": int(base.get("prompt_tokens", 0)) + int(usage_delta.get("prompt_tokens", 0)),
+        "completion_tokens": int(base.get("completion_tokens", 0))
+        + int(usage_delta.get("completion_tokens", 0)),
+        "total_tokens": int(base.get("total_tokens", 0)) + int(usage_delta.get("total_tokens", 0)),
+    }
+    return merged
 
 
 def _deterministic_reliability_score(claims: List[Dict[str, Any]]) -> int:
@@ -175,6 +240,9 @@ class ControllerDecision(BaseModel):
     confidence: float = Field(..., ge=0.0, le=1.0)
     rationale: str
     estimated_complexity: int = Field(..., ge=0, le=100)
+    expected_tool_calls_delta: int = Field(..., ge=0, le=20)
+    expected_token_proxy_delta: int = Field(..., ge=50, le=6000)
+    expected_runtime_seconds_delta: float = Field(..., ge=0.1, le=600.0)
     triggers: List[str] = Field(default_factory=list)
 
 
@@ -193,7 +261,7 @@ class SupervisorAgent:
 
 class IdeaRefinementAgent:
     def __init__(self, llm: ChatOpenAI):
-        self.structured_llm = llm.with_structured_output(RefinedIdea)
+        self.structured_llm = llm.with_structured_output(RefinedIdea, include_raw=True)
         self.prompt = ChatPromptTemplate.from_messages(
             [
                 (
@@ -217,21 +285,42 @@ class IdeaRefinementAgent:
 
     def run(self, state: PitchState) -> PitchState:
         idea = _sget(state, "idea", "")
-        result: RefinedIdea = self.structured_llm.invoke(
-            self.prompt.format_messages(idea=idea)
+        result, usage = _invoke_structured_with_usage(
+            self.structured_llm, self.prompt.format_messages(idea=idea)
         )
+        token_usage = _merge_token_usage(state, usage)
         refined = (
             f"Problem: {result.problem}\n"
             f"Solution: {result.solution}\n"
             f"Value Proposition: {result.value_proposition}\n"
             f"Summary: {result.refined_summary}"
         )
-        return {"refined_idea": refined}
+        return {"refined_idea": refined, "token_usage": token_usage}
 
 
 class AdaptiveControllerAgent:
+    MODE_ORDER = ["direct", "shallow", "recursive"]
+    MODE_QUALITY_PRIORITY = ["recursive", "shallow", "direct"]
+    MODE_PRIORS = {
+        "direct": {
+            "tool_calls": 4,
+            "token_proxy": 1700,
+            "runtime_seconds": 28.0,
+        },
+        "shallow": {
+            "tool_calls": 6,
+            "token_proxy": 3000,
+            "runtime_seconds": 38.0,
+        },
+        "recursive": {
+            "tool_calls": 8,
+            "token_proxy": 3900,
+            "runtime_seconds": 55.0,
+        },
+    }
+
     def __init__(self, llm: ChatOpenAI):
-        self.structured_llm = llm.with_structured_output(ControllerDecision)
+        self.structured_llm = llm.with_structured_output(ControllerDecision, include_raw=True)
         self.prompt = ChatPromptTemplate.from_messages(
             [
                 (
@@ -243,7 +332,8 @@ class AdaptiveControllerAgent:
                     "- `direct`: lowest decomposition and lowest cost for straightforward ideas.\n"
                     "- `shallow`: one-pass decomposition with validation and no recursive retry.\n"
                     "- `recursive`: decomposition with validation-driven retry for higher uncertainty.\n"
-                    "- Estimate complexity (0-100), confidence, and concise rationale.\n"
+                    "- Balance expected quality gains against remaining budget.\n"
+                    "- Estimate complexity (0-100), confidence, concise rationale, and expected incremental costs.\n"
                     "- Include short trigger phrases that justify the choice.\n\n"
                     "# Output Format\n"
                     "- Return content that strictly matches the structured schema fields.",
@@ -254,6 +344,7 @@ class AdaptiveControllerAgent:
                     "Refined idea:\n{refined_idea}\n\n"
                     "Validation threshold: {validation_threshold}\n"
                     "Max retries available: {max_validation_retries}\n\n"
+                    "Budget state:\n{budget_snapshot}\n\n"
                     "Select mode and provide rationale.",
                 ),
             ]
@@ -287,14 +378,23 @@ class AdaptiveControllerAgent:
             mode = "direct"
             confidence = 0.78
             rationale = "Idea appears relatively narrow and can be handled with low decomposition overhead."
+            expected_tool_calls_delta = 3
+            expected_token_proxy_delta = 1400
+            expected_runtime_seconds_delta = 18.0
         elif score < 60:
             mode = "shallow"
             confidence = 0.72
             rationale = "Idea has moderate complexity, so one decomposition pass with validation is appropriate."
+            expected_tool_calls_delta = 5
+            expected_token_proxy_delta = 2600
+            expected_runtime_seconds_delta = 32.0
         else:
             mode = "recursive"
             confidence = 0.69
             rationale = "Idea is high-complexity or high-uncertainty and benefits from validation-driven recursion."
+            expected_tool_calls_delta = 7
+            expected_token_proxy_delta = 3600
+            expected_runtime_seconds_delta = 48.0
 
         triggers = []
         if token_count >= 35:
@@ -311,35 +411,330 @@ class AdaptiveControllerAgent:
             confidence=confidence,
             rationale=rationale,
             estimated_complexity=score,
+            expected_tool_calls_delta=expected_tool_calls_delta,
+            expected_token_proxy_delta=expected_token_proxy_delta,
+            expected_runtime_seconds_delta=expected_runtime_seconds_delta,
             triggers=triggers,
         )
+
+    @staticmethod
+    def _compute_remaining_budget(state: PitchState | Dict[str, Any]) -> Dict[str, Any]:
+        max_tool_calls = _sget(state, "max_tool_calls")
+        max_token_proxy = _sget(state, "max_token_proxy")
+        max_total_tokens = _sget(state, "max_total_tokens")
+        max_runtime_seconds = _sget(state, "max_runtime_seconds")
+        tool_calls_current = int(_sget(state, "tool_calls_current", 0) or 0)
+        token_proxy_current = int(_sget(state, "token_proxy_current", 0) or 0)
+        total_tokens_current = int(_sget(state, "total_tokens_current", 0) or 0)
+        runtime_elapsed_seconds = float(_sget(state, "runtime_elapsed_seconds", 0.0) or 0.0)
+
+        return {
+            "max_tool_calls": max_tool_calls,
+            "max_token_proxy": max_token_proxy,
+            "max_total_tokens": max_total_tokens,
+            "max_runtime_seconds": max_runtime_seconds,
+            "tool_calls_current": tool_calls_current,
+            "token_proxy_current": token_proxy_current,
+            "total_tokens_current": total_tokens_current,
+            "runtime_elapsed_seconds": round(runtime_elapsed_seconds, 3),
+            "remaining_tool_calls": (
+                None
+                if max_tool_calls is None
+                else int(max_tool_calls) - tool_calls_current
+            ),
+            "remaining_token_proxy": (
+                None
+                if max_token_proxy is None
+                else int(max_token_proxy) - token_proxy_current
+            ),
+            "remaining_total_tokens": (
+                None
+                if max_total_tokens is None
+                else int(max_total_tokens) - total_tokens_current
+            ),
+            "remaining_runtime_seconds": (
+                None
+                if max_runtime_seconds is None
+                else round(float(max_runtime_seconds) - runtime_elapsed_seconds, 3)
+            ),
+        }
+
+    @staticmethod
+    def _budget_guardrail_mode(budget_snapshot: Dict[str, Any]) -> Optional[str]:
+        rem_calls = budget_snapshot.get("remaining_tool_calls")
+        rem_tokens = budget_snapshot.get("remaining_token_proxy")
+        rem_total_tokens = budget_snapshot.get("remaining_total_tokens")
+        rem_runtime = budget_snapshot.get("remaining_runtime_seconds")
+
+        tight = (
+            (isinstance(rem_calls, int) and rem_calls <= 2)
+            or (isinstance(rem_tokens, int) and rem_tokens <= 900)
+            or (isinstance(rem_total_tokens, int) and rem_total_tokens <= 900)
+            or (isinstance(rem_runtime, (int, float)) and rem_runtime <= 10.0)
+        )
+        moderate = (
+            (isinstance(rem_calls, int) and rem_calls <= 4)
+            or (isinstance(rem_tokens, int) and rem_tokens <= 1900)
+            or (isinstance(rem_total_tokens, int) and rem_total_tokens <= 1900)
+            or (isinstance(rem_runtime, (int, float)) and rem_runtime <= 22.0)
+        )
+
+        if tight:
+            return "direct"
+        if moderate:
+            return "shallow"
+        return None
+
+    @classmethod
+    def _prior_cost_for_mode(cls, mode: str, complexity: int) -> Dict[str, Any]:
+        base = cls.MODE_PRIORS.get(mode, cls.MODE_PRIORS["shallow"])
+        # Scale priors mildly by complexity (0-100 -> 0.9x to 1.25x).
+        scale = 0.9 + (max(0, min(100, complexity)) / 100.0) * 0.35
+        return {
+            "tool_calls": max(1, int(round(base["tool_calls"] * scale))),
+            "token_proxy": max(100, int(round(base["token_proxy"] * scale))),
+            "runtime_seconds": round(max(0.5, base["runtime_seconds"] * scale), 3),
+        }
+
+    @classmethod
+    def _calibrate_selected_cost(
+        cls,
+        decision: ControllerDecision,
+        mode_override: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        mode_for_prior = mode_override or decision.mode
+        prior = cls._prior_cost_for_mode(mode_for_prior, decision.estimated_complexity)
+        raw = {
+            "tool_calls": int(decision.expected_tool_calls_delta),
+            "token_proxy": int(decision.expected_token_proxy_delta),
+            "runtime_seconds": float(decision.expected_runtime_seconds_delta),
+        }
+        # Blend with prior and enforce non-trivial floor (80% of prior).
+        tool_calls = max(int(round(prior["tool_calls"] * 0.8)), int(round(0.75 * prior["tool_calls"] + 0.25 * raw["tool_calls"])))
+        token_proxy = max(int(round(prior["token_proxy"] * 0.8)), int(round(0.75 * prior["token_proxy"] + 0.25 * raw["token_proxy"])))
+        runtime_seconds = max(round(prior["runtime_seconds"] * 0.8, 3), round(0.75 * prior["runtime_seconds"] + 0.25 * raw["runtime_seconds"], 3))
+        return {
+            "tool_calls": tool_calls,
+            "token_proxy": token_proxy,
+            "runtime_seconds": runtime_seconds,
+            "prior": prior,
+            "raw": raw,
+        }
+
+    @staticmethod
+    def _complexity_features(text: str) -> Dict[str, Any]:
+        text_l = (text or "").lower()
+        tokens = re.findall(r"[a-zA-Z0-9]+", text_l)
+        marker_terms = [
+            "recursive",
+            "adversarial",
+            "uncertainty",
+            "uncertain",
+            "cross-border",
+            "jurisdiction",
+            "compliance",
+            "regulatory",
+            "critical infrastructure",
+            "rollback",
+            "re-plan",
+            "replanning",
+            "conflicting",
+            "safety",
+            "failure",
+            "multi-agent",
+        ]
+        marker_count = sum(1 for term in marker_terms if term in text_l)
+        return {
+            "token_count": len(tokens),
+            "marker_count": marker_count,
+            "has_high_stakes": marker_count >= 4,
+        }
+
+    @classmethod
+    def _should_promote_recursive(
+        cls,
+        *,
+        decision: ControllerDecision,
+        combined_text: str,
+        validation_threshold: int,
+        max_validation_retries: int,
+        budget_snapshot: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        # Deterministic promotion only in high-assurance setups.
+        if validation_threshold < 85 or max_validation_retries < 2:
+            return {"promote": False, "reason": None}
+
+        features = cls._complexity_features(combined_text)
+        complexity_signal = (
+            decision.estimated_complexity >= 40
+            or features["token_count"] >= 45
+            or features["marker_count"] >= 3
+            or features["has_high_stakes"]
+        )
+        confidence_signal = decision.confidence <= 0.86
+        rationale_l = (decision.rationale or "").lower()
+        uncertainty_signal = any(
+            token in rationale_l
+            for token in ["complex", "uncertain", "risk", "adversarial", "conflicting"]
+        )
+        if not complexity_signal:
+            return {"promote": False, "reason": None}
+        if not (confidence_signal or uncertainty_signal):
+            return {"promote": False, "reason": None}
+
+        recursive_cost = cls._prior_cost_for_mode("recursive", decision.estimated_complexity)
+        if not cls._is_mode_feasible(recursive_cost, budget_snapshot):
+            return {"promote": False, "reason": "recursive_not_budget_feasible"}
+
+        return {
+            "promote": True,
+            "reason": "deterministic_recursive_promotion_high_threshold",
+        }
+
+    @classmethod
+    def _is_mode_feasible(
+        cls,
+        mode_cost: Dict[str, Any],
+        budget_snapshot: Dict[str, Any],
+    ) -> bool:
+        rem_calls = budget_snapshot.get("remaining_tool_calls")
+        rem_proxy_tokens = budget_snapshot.get("remaining_token_proxy")
+        rem_total_tokens = budget_snapshot.get("remaining_total_tokens")
+        # Prefer true-token budget when available; otherwise fallback to proxy budget.
+        rem_tokens = rem_total_tokens if isinstance(rem_total_tokens, int) else rem_proxy_tokens
+        rem_runtime = budget_snapshot.get("remaining_runtime_seconds")
+        # Keep a risk buffer to reduce over-budget finishes caused by run-time variance.
+        calls_buffer = 0.9
+        tokens_buffer = 0.9
+        runtime_buffer = 0.8
+        if isinstance(rem_runtime, (int, float)):
+            if float(rem_runtime) <= 45.0:
+                runtime_buffer = 0.7
+            elif float(rem_runtime) <= 60.0:
+                runtime_buffer = 0.75
+
+        if isinstance(rem_calls, int) and mode_cost["tool_calls"] > max(0, int(rem_calls * calls_buffer)):
+            return False
+        if isinstance(rem_tokens, int) and mode_cost["token_proxy"] > max(0, int(rem_tokens * tokens_buffer)):
+            return False
+        if isinstance(rem_runtime, (int, float)) and mode_cost["runtime_seconds"] > max(0.0, float(rem_runtime) * runtime_buffer):
+            return False
+        return True
+
+    @classmethod
+    def _best_feasible_mode(
+        cls,
+        initial_mode: str,
+        budget_snapshot: Dict[str, Any],
+        complexity: int,
+    ) -> Dict[str, Any]:
+        costs_by_mode = {
+            mode: cls._prior_cost_for_mode(mode, complexity) for mode in cls.MODE_ORDER
+        }
+        initial_cost = costs_by_mode.get(initial_mode, costs_by_mode["shallow"])
+        if cls._is_mode_feasible(initial_cost, budget_snapshot):
+            return {
+                "mode_final": initial_mode,
+                "override": False,
+                "override_reason": None,
+                "costs_by_mode": costs_by_mode,
+            }
+
+        for mode in cls.MODE_QUALITY_PRIORITY:
+            if cls._is_mode_feasible(costs_by_mode[mode], budget_snapshot):
+                return {
+                    "mode_final": mode,
+                    "override": mode != initial_mode,
+                    "override_reason": f"budget_feasible_mode_{mode}",
+                    "costs_by_mode": costs_by_mode,
+                }
+        return {
+            "mode_final": "direct",
+            "override": initial_mode != "direct",
+            "override_reason": "no_mode_fits_budget_forced_direct",
+            "costs_by_mode": costs_by_mode,
+        }
 
     def run(self, state: PitchState) -> PitchState:
         idea = _sget(state, "idea", "")
         refined = _sget(state, "refined_idea", "")
         combined = f"{idea}\n{refined}".strip()
+        validation_threshold = int(_sget(state, "validation_threshold", 70) or 70)
+        max_validation_retries = int(_sget(state, "max_validation_retries", 1) or 1)
+        budget_snapshot = self._compute_remaining_budget(state)
+        usage = _empty_token_usage()
         try:
-            decision: ControllerDecision = self.structured_llm.invoke(
+            decision, usage = _invoke_structured_with_usage(
+                self.structured_llm,
                 self.prompt.format_messages(
                     idea=idea,
                     refined_idea=refined,
-                    validation_threshold=_sget(state, "validation_threshold", 70),
-                    max_validation_retries=_sget(state, "max_validation_retries", 1),
-                )
+                    validation_threshold=validation_threshold,
+                    max_validation_retries=max_validation_retries,
+                    budget_snapshot=json.dumps(budget_snapshot, indent=2),
+                ),
             )
         except Exception:  # noqa: BLE001
             decision = self._fallback_decision(combined)
+        token_usage = _merge_token_usage(state, usage)
+
+        chosen_mode_initial = decision.mode
+        chosen_mode_final = decision.mode
+        budget_override = False
+        deterministic_trigger = None
+        promotion = self._should_promote_recursive(
+            decision=decision,
+            combined_text=combined,
+            validation_threshold=validation_threshold,
+            max_validation_retries=max_validation_retries,
+            budget_snapshot=budget_snapshot,
+        )
+        if promotion["promote"] and chosen_mode_initial != "recursive":
+            chosen_mode_initial = "recursive"
+            deterministic_trigger = promotion["reason"]
+
+        calibrated_selected = self._calibrate_selected_cost(
+            decision,
+            mode_override=chosen_mode_initial,
+        )
+        feasible_pick = self._best_feasible_mode(
+            initial_mode=chosen_mode_initial,
+            budget_snapshot=budget_snapshot,
+            complexity=decision.estimated_complexity,
+        )
+        chosen_mode_final = feasible_pick["mode_final"]
+        budget_override = feasible_pick["override"]
+        budget_guard = self._budget_guardrail_mode(budget_snapshot)
+        guardrail_trigger = None
+        if budget_override and feasible_pick["override_reason"]:
+            guardrail_trigger = feasible_pick["override_reason"]
+        if budget_guard is not None and budget_guard != chosen_mode_final:
+            chosen_mode_final = budget_guard
+            budget_override = True
+            guardrail_trigger = f"budget_guardrail_forced_{budget_guard}"
 
         depth_map = {"direct": 0, "shallow": 1, "recursive": 2}
         decisions = list(_sget(state, "controller_decisions", []))
         tool_audit = list(_sget(state, "tool_audit", []))
+        trigger_chain = list(decision.triggers)
+        if deterministic_trigger:
+            trigger_chain.append(deterministic_trigger)
+        if guardrail_trigger:
+            trigger_chain.append(guardrail_trigger)
         decisions.append(
             {
-                "mode": decision.mode,
+                "mode_initial": chosen_mode_initial,
+                "mode_final": chosen_mode_final,
                 "confidence": decision.confidence,
                 "estimated_complexity": decision.estimated_complexity,
-                "triggers": decision.triggers,
+                "triggers": trigger_chain,
                 "rationale": decision.rationale,
+                "expected_tool_calls_delta": calibrated_selected["tool_calls"],
+                "expected_token_proxy_delta": calibrated_selected["token_proxy"],
+                "expected_runtime_seconds_delta": calibrated_selected["runtime_seconds"],
+                "costs_by_mode": feasible_pick["costs_by_mode"],
+                "budget_override": budget_override,
+                "deterministic_recursive_promotion": bool(deterministic_trigger),
             }
         )
         tool_audit.append(
@@ -347,19 +742,39 @@ class AdaptiveControllerAgent:
                 "agent": "adaptive_controller",
                 "tool": "mode_selector",
                 "status": "ok",
-                "mode": decision.mode,
+                "mode_initial": chosen_mode_initial,
+                "mode_final": chosen_mode_final,
                 "confidence": decision.confidence,
                 "estimated_complexity": decision.estimated_complexity,
-                "triggers": decision.triggers,
+                "triggers": trigger_chain,
+                "expected_tool_calls_delta": calibrated_selected["tool_calls"],
+                "expected_token_proxy_delta": calibrated_selected["token_proxy"],
+                "expected_runtime_seconds_delta": calibrated_selected["runtime_seconds"],
+                "costs_by_mode": feasible_pick["costs_by_mode"],
+                "budget_override": budget_override,
+                "deterministic_recursive_promotion": bool(deterministic_trigger),
             }
         )
         return {
-            "controller_mode": decision.mode,
+            "controller_mode": chosen_mode_final,
+            "controller_mode_initial": chosen_mode_initial,
+            "controller_budget_override": budget_override,
             "controller_confidence": decision.confidence,
             "controller_rationale": decision.rationale,
+            "controller_expected_cost": {
+                "expected_tool_calls_delta": calibrated_selected["tool_calls"],
+                "expected_token_proxy_delta": calibrated_selected["token_proxy"],
+                "expected_runtime_seconds_delta": calibrated_selected["runtime_seconds"],
+                "raw_model_estimate": calibrated_selected["raw"],
+                "prior_for_mode": calibrated_selected["prior"],
+                "costs_by_mode": feasible_pick["costs_by_mode"],
+                "mode_for_estimate": chosen_mode_initial,
+            },
+            "controller_budget_snapshot": budget_snapshot,
             "controller_decisions": decisions,
-            "decomposition_depth_target": depth_map.get(decision.mode, 1),
+            "decomposition_depth_target": depth_map.get(chosen_mode_final, 1),
             "tool_audit": tool_audit,
+            "token_usage": token_usage,
         }
 
 
@@ -370,8 +785,8 @@ class MarketResearchAgent:
         strict_tools: bool = True,
         enable_trends: bool = True,
     ):
-        self.structured_llm = llm.with_structured_output(MarketOutput)
-        self.keyword_llm = llm.with_structured_output(TrendKeywords)
+        self.structured_llm = llm.with_structured_output(MarketOutput, include_raw=True)
+        self.keyword_llm = llm.with_structured_output(TrendKeywords, include_raw=True)
         self.search_tool = MarketSearchTool()
         self.trends_tool = GoogleTrendsTool() if enable_trends else None
         self.strict_tools = strict_tools
@@ -422,6 +837,7 @@ class MarketResearchAgent:
 
     def run(self, state: PitchState) -> PitchState:
         refined_idea = _sget(state, "refined_idea", "")
+        total_usage = _empty_token_usage()
         retry_count = _sget(state, "retry_count", 0)
         query_suffix = (
             " prioritize authoritative and recent sources with concrete numbers"
@@ -434,9 +850,11 @@ class MarketResearchAgent:
             raise RuntimeError(f"Market search tool unavailable: {search_payload['error']}")
         search_results = search_payload["results_json"]
         try:
-            kw_model: TrendKeywords = self.keyword_llm.invoke(
-                self.keyword_prompt.format_messages(refined_idea=refined_idea)
+            kw_model, kw_usage = _invoke_structured_with_usage(
+                self.keyword_llm,
+                self.keyword_prompt.format_messages(refined_idea=refined_idea),
             )
+            total_usage = _merge_token_usage({"token_usage": total_usage}, kw_usage)
             extracted_keywords = [k.strip() for k in kw_model.keywords if k.strip()]
         except Exception:  # noqa: BLE001
             extracted_keywords = _fallback_keywords(refined_idea)
@@ -450,13 +868,16 @@ class MarketResearchAgent:
                 "error": "Google Trends disabled by configuration.",
             }
 
-        result: MarketOutput = self.structured_llm.invoke(
+        result, market_usage = _invoke_structured_with_usage(
+            self.structured_llm,
             self.prompt.format_messages(
                 refined_idea=refined_idea,
                 search_results=search_results,
                 trend_signals=json.dumps(trend_payload, indent=2),
-            )
+            ),
         )
+        total_usage = _merge_token_usage({"token_usage": total_usage}, market_usage)
+        token_usage = _merge_token_usage(state, total_usage)
         market_analysis = (
             f"Target Market: {result.target_market}\n"
             f"Market Size: {result.market_size}\n"
@@ -492,12 +913,13 @@ class MarketResearchAgent:
             "market_evidence": search_payload["results"],
             "trend_signals": trend_payload,
             "tool_audit": tool_audit,
+            "token_usage": token_usage,
         }
 
 
 class SourceValidatorAgent:
     def __init__(self, llm: ChatOpenAI):
-        self.structured_llm = llm.with_structured_output(ValidationOutput)
+        self.structured_llm = llm.with_structured_output(ValidationOutput, include_raw=True)
         self.prompt = ChatPromptTemplate.from_messages(
             [
                 (
@@ -523,13 +945,15 @@ class SourceValidatorAgent:
 
     def run(self, state: PitchState) -> PitchState:
         evidence_json = json.dumps(_sget(state, "market_evidence", []), indent=2)
-        result: ValidationOutput = self.structured_llm.invoke(
+        result, usage = _invoke_structured_with_usage(
+            self.structured_llm,
             self.prompt.format_messages(
                 refined_idea=_sget(state, "refined_idea", ""),
                 market_analysis=_sget(state, "market_analysis", ""),
                 market_evidence=evidence_json,
-            )
+            ),
         )
+        token_usage = _merge_token_usage(state, usage)
         report: Dict[str, Any] = json.loads(result.model_dump_json())
         deterministic_score = _deterministic_reliability_score(report.get("claims", []))
         report["reliability_score"] = deterministic_score
@@ -547,6 +971,9 @@ class SourceValidatorAgent:
                 "status": "ok",
                 "claims_checked": len(report.get("claims", [])),
                 "reliability_score": deterministic_score,
+                "prompt_tokens": usage.get("prompt_tokens", 0),
+                "completion_tokens": usage.get("completion_tokens", 0),
+                "total_tokens": usage.get("total_tokens", 0),
             }
         )
         return {
@@ -554,6 +981,7 @@ class SourceValidatorAgent:
             "validated_market_analysis": validated,
             "needs_revision": deterministic_score < _sget(state, "validation_threshold", 70),
             "tool_audit": tool_audit,
+            "token_usage": token_usage,
         }
 
 
@@ -564,7 +992,7 @@ class DirectStrategyAgent:
         strict_tools: bool = True,
         enable_trends: bool = True,
     ):
-        self.structured_llm = llm.with_structured_output(DirectStrategyOutput)
+        self.structured_llm = llm.with_structured_output(DirectStrategyOutput, include_raw=True)
         self.validator_agent = SourceValidatorAgent(llm)
         self.search_tool = MarketSearchTool()
         self.trends_tool = GoogleTrendsTool() if enable_trends else None
@@ -597,6 +1025,7 @@ class DirectStrategyAgent:
 
     def run(self, state: PitchState) -> PitchState:
         refined_idea = _sget(state, "refined_idea", "")
+        total_usage = _empty_token_usage()
         query = f"startup market size competitors trends for: {refined_idea}"
         search_payload = self.search_tool.search(query)
         if self.strict_tools and search_payload["status"] != "ok":
@@ -613,13 +1042,16 @@ class DirectStrategyAgent:
                 "error": "Google Trends disabled by configuration.",
             }
 
-        result: DirectStrategyOutput = self.structured_llm.invoke(
+        result, direct_usage = _invoke_structured_with_usage(
+            self.structured_llm,
             self.prompt.format_messages(
                 refined_idea=refined_idea,
                 search_results=search_payload["results_json"],
                 trend_signals=json.dumps(trend_payload, indent=2),
-            )
+            ),
         )
+        total_usage = _merge_token_usage({"token_usage": total_usage}, direct_usage)
+        token_usage = _merge_token_usage(state, total_usage)
         market_analysis = (
             f"Target Market: {result.target_market}\n"
             f"Market Size: {result.market_size}\n"
@@ -666,6 +1098,9 @@ print(f'Year1 Gross Profit: ${{gross_profit:,.0f}}')
                 "agent": "adaptive_direct_strategy",
                 "tool": "llm_direct_synthesis",
                 "status": "ok",
+                "prompt_tokens": direct_usage.get("prompt_tokens", 0),
+                "completion_tokens": direct_usage.get("completion_tokens", 0),
+                "total_tokens": direct_usage.get("total_tokens", 0),
             }
         )
         tool_audit.append(
@@ -717,6 +1152,7 @@ print(f'Year1 Gross Profit: ${{gross_profit:,.0f}}')
             "financial_assumptions": assumptions,
             "scenario_analysis": scenario_output,
             "tool_audit": tool_audit,
+            "token_usage": token_usage,
             "decomposition_depth_realized": 0,
         }
         validated_update = self.validator_agent.run(candidate_state)
@@ -733,14 +1169,15 @@ print(f'Year1 Gross Profit: ${{gross_profit:,.0f}}')
             "validated_market_analysis": candidate_state.get("validated_market_analysis"),
             "needs_revision": candidate_state.get("needs_revision", False),
             "tool_audit": candidate_state["tool_audit"],
+            "token_usage": candidate_state.get("token_usage", token_usage),
             "decomposition_depth_realized": 0,
         }
 
 
 class BusinessModelAgent:
     def __init__(self, llm: ChatOpenAI, strict_tools: bool = True):
-        self.structured_llm = llm.with_structured_output(BusinessOutput)
-        self.assumptions_llm = llm.with_structured_output(FinancialAssumptions)
+        self.structured_llm = llm.with_structured_output(BusinessOutput, include_raw=True)
+        self.assumptions_llm = llm.with_structured_output(FinancialAssumptions, include_raw=True)
         self.calc_tool = BusinessCalcTool()
         self.scenario_tool = ScenarioAnalysisTool()
         self.strict_tools = strict_tools
@@ -793,7 +1230,8 @@ class BusinessModelAgent:
         )
 
     def run(self, state: PitchState) -> PitchState:
-        assumptions_model: FinancialAssumptions = self.assumptions_llm.invoke(
+        assumptions_model, assumptions_usage = _invoke_structured_with_usage(
+            self.assumptions_llm,
             self.assumptions_prompt.format_messages(
                 refined_idea=_sget(state, "refined_idea", ""),
                 market_analysis=(
@@ -804,8 +1242,9 @@ class BusinessModelAgent:
                 validation_score=_sget(state, "validation_report", {}).get(
                     "reliability_score", 0
                 ),
-            )
+            ),
         )
+        total_usage = _merge_token_usage({"token_usage": _empty_token_usage()}, assumptions_usage)
         assumptions = {
             "users_year1": max(1000, min(500000, int(assumptions_model.users_year1))),
             "arpu_monthly": round(max(2.0, min(300.0, float(assumptions_model.arpu_monthly))), 2),
@@ -830,7 +1269,8 @@ print(f'Year1 Gross Profit: ${{gross_profit:,.0f}}')
             gross_margin=assumptions["gross_margin"],
         )
 
-        result: BusinessOutput = self.structured_llm.invoke(
+        result, business_usage = _invoke_structured_with_usage(
+            self.structured_llm,
             self.prompt.format_messages(
                 refined_idea=_sget(state, "refined_idea", ""),
                 market_analysis=(
@@ -840,8 +1280,10 @@ print(f'Year1 Gross Profit: ${{gross_profit:,.0f}}')
                 financial_assumptions=json.dumps(assumptions, indent=2),
                 calc_output=calc_output,
                 scenario_output=json.dumps(scenario_output, indent=2),
-            )
+            ),
         )
+        total_usage = _merge_token_usage({"token_usage": total_usage}, business_usage)
+        token_usage = _merge_token_usage(state, total_usage)
         business_model = (
             f"Revenue Streams: {result.revenue_streams}\n"
             f"Pricing Strategy: {result.pricing_strategy}\n"
@@ -860,6 +1302,12 @@ print(f'Year1 Gross Profit: ${{gross_profit:,.0f}}')
                 "status": "ok" if not calc_output.startswith("Python calc failed:") else "error",
                 "assumptions": assumptions,
                 "error": calc_output if calc_output.startswith("Python calc failed:") else "",
+                "prompt_tokens_assumptions": assumptions_usage.get("prompt_tokens", 0),
+                "completion_tokens_assumptions": assumptions_usage.get("completion_tokens", 0),
+                "total_tokens_assumptions": assumptions_usage.get("total_tokens", 0),
+                "prompt_tokens_business": business_usage.get("prompt_tokens", 0),
+                "completion_tokens_business": business_usage.get("completion_tokens", 0),
+                "total_tokens_business": business_usage.get("total_tokens", 0),
             }
         )
         tool_audit.append(
@@ -876,12 +1324,13 @@ print(f'Year1 Gross Profit: ${{gross_profit:,.0f}}')
             "financial_assumptions": assumptions,
             "scenario_analysis": scenario_output,
             "tool_audit": tool_audit,
+            "token_usage": token_usage,
         }
 
 
 class PitchDeckGeneratorAgent:
     def __init__(self, llm: ChatOpenAI, output_dir: str = "output"):
-        self.structured_llm = llm.with_structured_output(PitchSlides)
+        self.structured_llm = llm.with_structured_output(PitchSlides, include_raw=True)
         self.output_dir = Path(output_dir)
         self.prompt = ChatPromptTemplate.from_messages(
             [
@@ -907,7 +1356,8 @@ class PitchDeckGeneratorAgent:
         )
 
     def run(self, state: PitchState) -> PitchState:
-        slide_model: PitchSlides = self.structured_llm.invoke(
+        slide_model, usage = _invoke_structured_with_usage(
+            self.structured_llm,
             self.prompt.format_messages(
                 refined_idea=_sget(state, "refined_idea", ""),
                 market_analysis=(
@@ -915,8 +1365,9 @@ class PitchDeckGeneratorAgent:
                     or _sget(state, "market_analysis", "")
                 ),
                 business_model=_sget(state, "business_model", ""),
-            )
+            ),
         )
+        token_usage = _merge_token_usage(state, usage)
         slide_dict: Dict[str, str] = json.loads(slide_model.model_dump_json())
 
         summary_line = _sget(state, "refined_idea", "")
@@ -934,6 +1385,14 @@ class PitchDeckGeneratorAgent:
                 "tool": "python_pptx",
                 "status": "ok",
                 "output_path": saved,
+                "prompt_tokens": usage.get("prompt_tokens", 0),
+                "completion_tokens": usage.get("completion_tokens", 0),
+                "total_tokens": usage.get("total_tokens", 0),
             }
         )
-        return {"pitch_content": slide_dict, "ppt_path": saved, "tool_audit": tool_audit}
+        return {
+            "pitch_content": slide_dict,
+            "ppt_path": saved,
+            "tool_audit": tool_audit,
+            "token_usage": token_usage,
+        }

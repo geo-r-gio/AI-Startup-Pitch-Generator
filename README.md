@@ -101,7 +101,7 @@ cp .env.example .env
 Optional:
 
 ```bash
-.venv/bin/python main.py --idea "AI coach for job interviews" --controller-policy adaptive --model "gpt-4.1-nano" --temperature 0 --seed 42 --thread-id run-001 --validation-threshold 75 --max-validation-retries 1 --save-json output/final_state.json
+.venv/bin/python main.py --idea "AI coach for job interviews" --controller-policy adaptive --model "gpt-4.1-nano" --temperature 0 --seed 42 --thread-id run-001 --validation-threshold 75 --max-validation-retries 1 --max-tool-calls 12 --max-token-proxy 4500 --max-runtime-seconds 120 --save-json output/final_state.json
 ```
 
 Methodology comparison mode (single-agent baseline vs fixed/adaptive multi-agent):
@@ -112,14 +112,42 @@ Methodology comparison mode (single-agent baseline vs fixed/adaptive multi-agent
   --idea "AI coach for job interviews" \
   --compare-strategies "single_agent,multi_agent,adaptive_controller" \
   --compare-runs 3 \
+  --max-tool-calls 12 \
+  --max-token-proxy 4500 \
+  --max-total-tokens 4500 \
+  --max-runtime-seconds 120 \
   --thread-id methodology-run \
   --compare-output output/methodology_comparison.json
+```
+
+Batch methodology comparison over multiple ideas (newline-delimited file) with CSV exports:
+
+```bash
+.venv/bin/python main.py \
+  --mode compare \
+  --idea "placeholder" \
+  --ideas-file /tmp/method_ideas.txt \
+  --compare-strategies "single_agent,multi_agent,adaptive_controller" \
+  --compare-runs 2 \
+  --compare-export-csv \
+  --compare-output output/methodology_batch.json \
+  --runs-csv-output output/methodology_runs.csv \
+  --aggregate-csv-output output/methodology_aggregate.csv \
+  --best-summary-output output/methodology_best_summary.json
 ```
 
 Notes:
 - `--compare-runs` repeats each strategy to reduce variance.
 - `--compare-generate-ppt` is optional and slower; compare mode defaults to metrics-first.
-- Comparison report includes run-level metrics (reliability, latency, source count, token proxy, retries, realized decomposition depth) and strategy-level aggregates.
+- Budget flags (`--max-tool-calls`, `--max-token-proxy`, `--max-total-tokens`, `--max-runtime-seconds`) are applied uniformly across strategies for matched-budget comparisons.
+- Adaptive controller is budget-aware and can override an initially chosen mode (`direct/shallow/recursive`) when remaining budget is tight.
+- Comparison report includes run-level metrics (reliability, latency, source count, token proxy, retries, retry effectiveness, realized decomposition depth, depth-vs-reliability gain, budget-hit indicators, and reliability-per-cost metrics) and strategy-level aggregates (including mode distribution).
+- Token accounting now includes both:
+  - actual OpenAI token usage (`prompt_tokens_total`, `completion_tokens_total`, `actual_total_tokens`)
+  - deterministic token proxy (`token_proxy_total`) for backward-compatible budget heuristics
+- When `--compare-export-csv` is enabled, compact CSVs are also generated automatically:
+  - `<runs_csv_output_stem>_compact.csv`
+  - `<aggregate_csv_output_stem>_compact.csv`
 
 Skip trends when blocked/rate-limited:
 
@@ -150,6 +178,7 @@ Force fresh slide images (do not reuse cache):
 - Claim verification output in `validation_report` and `validated_market_analysis`
 - Dynamic bounded assumptions in `financial_assumptions`
 - Deterministic scenario projections in `scenario_analysis`
+- True OpenAI token accounting in `token_usage` and `*_tokens_*` metrics (separate from `token_proxy_*`)
 
 ## Project Structure
 
