@@ -171,8 +171,11 @@ def main() -> None:
     parser.add_argument(
         "--compare-strategies",
         type=str,
-        default="single_agent,multi_agent,adaptive_controller",
-        help="Comma-separated strategies for compare mode. Allowed: single_agent,multi_agent,adaptive_controller",
+        default="single_agent,fixed_shallow,fixed_recursive,adaptive_controller",
+        help=(
+            "Comma-separated strategies for compare mode. "
+            "Allowed: single_agent,multi_agent,fixed_direct,fixed_shallow,fixed_recursive,adaptive_controller"
+        ),
     )
     parser.add_argument(
         "--compare-output",

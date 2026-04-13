@@ -412,6 +412,7 @@ class StartupPitchRefinery:
         max_token_proxy: int | None = None,
         max_total_tokens: int | None = None,
         max_runtime_seconds: float | None = None,
+        forced_controller_mode: str | None = None,
     ) -> PitchState:
         normalized_max_tool_calls = (
             None if max_tool_calls is None or max_tool_calls < 0 else int(max_tool_calls)
@@ -432,6 +433,7 @@ class StartupPitchRefinery:
             PitchState(
                 idea=idea,
                 controller_policy=self.controller_policy,
+                forced_controller_mode=forced_controller_mode,
                 max_validation_retries=max_validation_retries,
                 validation_threshold=validation_threshold,
                 max_tool_calls=normalized_max_tool_calls,

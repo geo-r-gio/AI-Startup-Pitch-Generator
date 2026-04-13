@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 class PitchState(BaseModel):
     idea: str
     controller_policy: str = "fixed"
+    forced_controller_mode: Optional[str] = None
     controller_mode: Optional[str] = None
     controller_mode_initial: Optional[str] = None
     controller_budget_override: bool = False

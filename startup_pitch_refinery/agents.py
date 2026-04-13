@@ -663,55 +663,88 @@ class AdaptiveControllerAgent:
         max_validation_retries = int(_sget(state, "max_validation_retries", 1) or 1)
         budget_snapshot = self._compute_remaining_budget(state)
         usage = _empty_token_usage()
-        try:
-            decision, usage = _invoke_structured_with_usage(
-                self.structured_llm,
-                self.prompt.format_messages(
-                    idea=idea,
-                    refined_idea=refined,
-                    validation_threshold=validation_threshold,
-                    max_validation_retries=max_validation_retries,
-                    budget_snapshot=json.dumps(budget_snapshot, indent=2),
-                ),
+        forced_mode = str(_sget(state, "forced_controller_mode", "") or "").strip().lower()
+        forced_mode_applied = forced_mode in self.MODE_ORDER
+        if forced_mode_applied:
+            fallback = self._fallback_decision(combined)
+            decision = ControllerDecision(
+                mode=forced_mode,  # type: ignore[arg-type]
+                confidence=1.0,
+                rationale=f"Forced controller mode `{forced_mode}` for fixed-policy baseline.",
+                estimated_complexity=fallback.estimated_complexity,
+                expected_tool_calls_delta=fallback.expected_tool_calls_delta,
+                expected_token_proxy_delta=fallback.expected_token_proxy_delta,
+                expected_runtime_seconds_delta=fallback.expected_runtime_seconds_delta,
+                triggers=["forced_mode_baseline"],
             )
-        except Exception:  # noqa: BLE001
-            decision = self._fallback_decision(combined)
+        else:
+            try:
+                decision, usage = _invoke_structured_with_usage(
+                    self.structured_llm,
+                    self.prompt.format_messages(
+                        idea=idea,
+                        refined_idea=refined,
+                        validation_threshold=validation_threshold,
+                        max_validation_retries=max_validation_retries,
+                        budget_snapshot=json.dumps(budget_snapshot, indent=2),
+                    ),
+                )
+            except Exception:  # noqa: BLE001
+                decision = self._fallback_decision(combined)
         token_usage = _merge_token_usage(state, usage)
 
         chosen_mode_initial = decision.mode
         chosen_mode_final = decision.mode
         budget_override = False
         deterministic_trigger = None
-        promotion = self._should_promote_recursive(
-            decision=decision,
-            combined_text=combined,
-            validation_threshold=validation_threshold,
-            max_validation_retries=max_validation_retries,
-            budget_snapshot=budget_snapshot,
-        )
-        if promotion["promote"] and chosen_mode_initial != "recursive":
-            chosen_mode_initial = "recursive"
-            deterministic_trigger = promotion["reason"]
-
-        calibrated_selected = self._calibrate_selected_cost(
-            decision,
-            mode_override=chosen_mode_initial,
-        )
-        feasible_pick = self._best_feasible_mode(
-            initial_mode=chosen_mode_initial,
-            budget_snapshot=budget_snapshot,
-            complexity=decision.estimated_complexity,
-        )
-        chosen_mode_final = feasible_pick["mode_final"]
-        budget_override = feasible_pick["override"]
-        budget_guard = self._budget_guardrail_mode(budget_snapshot)
         guardrail_trigger = None
-        if budget_override and feasible_pick["override_reason"]:
-            guardrail_trigger = feasible_pick["override_reason"]
-        if budget_guard is not None and budget_guard != chosen_mode_final:
-            chosen_mode_final = budget_guard
-            budget_override = True
-            guardrail_trigger = f"budget_guardrail_forced_{budget_guard}"
+
+        if forced_mode_applied:
+            chosen_mode_initial = forced_mode  # type: ignore[assignment]
+            chosen_mode_final = forced_mode  # type: ignore[assignment]
+            calibrated_selected = self._calibrate_selected_cost(
+                decision,
+                mode_override=chosen_mode_initial,
+            )
+            feasible_pick = {
+                "mode_final": chosen_mode_final,
+                "override": False,
+                "override_reason": "forced_mode_no_override",
+                "costs_by_mode": {
+                    mode: self._prior_cost_for_mode(mode, decision.estimated_complexity)
+                    for mode in self.MODE_ORDER
+                },
+            }
+        else:
+            promotion = self._should_promote_recursive(
+                decision=decision,
+                combined_text=combined,
+                validation_threshold=validation_threshold,
+                max_validation_retries=max_validation_retries,
+                budget_snapshot=budget_snapshot,
+            )
+            if promotion["promote"] and chosen_mode_initial != "recursive":
+                chosen_mode_initial = "recursive"
+                deterministic_trigger = promotion["reason"]
+
+            calibrated_selected = self._calibrate_selected_cost(
+                decision,
+                mode_override=chosen_mode_initial,
+            )
+            feasible_pick = self._best_feasible_mode(
+                initial_mode=chosen_mode_initial,
+                budget_snapshot=budget_snapshot,
+                complexity=decision.estimated_complexity,
+            )
+            chosen_mode_final = feasible_pick["mode_final"]
+            budget_override = feasible_pick["override"]
+            budget_guard = self._budget_guardrail_mode(budget_snapshot)
+            if budget_override and feasible_pick["override_reason"]:
+                guardrail_trigger = feasible_pick["override_reason"]
+            if budget_guard is not None and budget_guard != chosen_mode_final:
+                chosen_mode_final = budget_guard
+                budget_override = True
+                guardrail_trigger = f"budget_guardrail_forced_{budget_guard}"
 
         depth_map = {"direct": 0, "shallow": 1, "recursive": 2}
         decisions = list(_sget(state, "controller_decisions", []))
@@ -735,6 +768,7 @@ class AdaptiveControllerAgent:
                 "costs_by_mode": feasible_pick["costs_by_mode"],
                 "budget_override": budget_override,
                 "deterministic_recursive_promotion": bool(deterministic_trigger),
+                "forced_mode_applied": forced_mode_applied,
             }
         )
         tool_audit.append(
@@ -753,6 +787,7 @@ class AdaptiveControllerAgent:
                 "costs_by_mode": feasible_pick["costs_by_mode"],
                 "budget_override": budget_override,
                 "deterministic_recursive_promotion": bool(deterministic_trigger),
+                "forced_mode_applied": forced_mode_applied,
             }
         )
         return {

@@ -608,10 +608,22 @@ def run_methodology_comparison(
     thread_prefix: str = "methodology",
     output_dir: str = "output",
 ) -> Dict[str, Any]:
-    strategies = strategies or ["single_agent", "multi_agent", "adaptive_controller"]
+    strategies = strategies or [
+        "single_agent",
+        "fixed_shallow",
+        "fixed_recursive",
+        "adaptive_controller",
+    ]
     normalized = [s.strip().lower() for s in strategies if s.strip()]
 
-    allowed = {"single_agent", "multi_agent", "adaptive_controller"}
+    allowed = {
+        "single_agent",
+        "multi_agent",
+        "fixed_direct",
+        "fixed_shallow",
+        "fixed_recursive",
+        "adaptive_controller",
+    }
     invalid = [s for s in normalized if s not in allowed]
     if invalid:
         raise ValueError(f"Unsupported strategies: {invalid}. Allowed: {sorted(allowed)}")
@@ -639,7 +651,9 @@ def run_methodology_comparison(
         )
 
     adaptive_runner = None
-    if "adaptive_controller" in normalized:
+    if "adaptive_controller" in normalized or any(
+        s in normalized for s in {"fixed_direct", "fixed_shallow", "fixed_recursive"}
+    ):
         adaptive_runner = StartupPitchRefinery(
             model=model,
             temperature=temperature,
@@ -679,6 +693,20 @@ def run_methodology_comparison(
                     max_token_proxy=max_token_proxy,
                     max_total_tokens=max_total_tokens,
                     max_runtime_seconds=max_runtime_seconds,
+                )
+            elif strategy in {"fixed_direct", "fixed_shallow", "fixed_recursive"}:
+                assert adaptive_runner is not None
+                forced = strategy.replace("fixed_", "")
+                state = adaptive_runner.run(
+                    idea=idea,
+                    thread_id=f"{thread_prefix}-{strategy}-{run_idx}",
+                    max_validation_retries=max_validation_retries,
+                    validation_threshold=validation_threshold,
+                    max_tool_calls=max_tool_calls,
+                    max_token_proxy=max_token_proxy,
+                    max_total_tokens=max_total_tokens,
+                    max_runtime_seconds=max_runtime_seconds,
+                    forced_controller_mode=forced,
                 )
             else:
                 assert adaptive_runner is not None
@@ -961,7 +989,15 @@ def run_methodology_batch_comparison(
             "model": model,
             "temperature": temperature,
             "seed": seed,
-            "strategies": (strategies or ["single_agent", "multi_agent", "adaptive_controller"]),
+            "strategies": (
+                strategies
+                or [
+                    "single_agent",
+                    "fixed_shallow",
+                    "fixed_recursive",
+                    "adaptive_controller",
+                ]
+            ),
             "compare_runs": compare_runs,
             "validation_threshold": validation_threshold,
             "max_validation_retries": max_validation_retries,
