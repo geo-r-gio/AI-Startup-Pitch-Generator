@@ -11,7 +11,11 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
-from startup_pitch_refinery.agents import PitchDeckGeneratorAgent, SourceValidatorAgent
+from startup_pitch_refinery.agents import (
+    IdeaRefinementAgent,
+    PitchDeckGeneratorAgent,
+    SourceValidatorAgent,
+)
 from startup_pitch_refinery.graph import StartupPitchRefinery
 from startup_pitch_refinery.tools import GoogleTrendsTool, MarketSearchTool, ScenarioAnalysisTool
 
@@ -139,16 +143,208 @@ def _extract_metrics(state: Dict[str, Any], strategy: str, runtime_seconds: floa
         reliability_score / max(0.001, float(runtime_seconds)), 4
     )
     agreement_stats = validation.get("agreement_stats", {}) if isinstance(validation, dict) else {}
+    scorecard = state.get("controller_scorecard", {}) or {}
+    forced_mode_applied = (
+        bool(scorecard.get("forced_mode_applied", False))
+        if isinstance(scorecard, dict)
+        else False
+    )
+    score_features = scorecard.get("features", {}) if isinstance(scorecard, dict) else {}
+    mode_scores = scorecard.get("mode_scores", {}) if isinstance(scorecard, dict) else {}
+    controller_mode_realized = str(state.get("controller_mode", "n/a") or "n/a")
+    controller_mode_initial = str(
+        state.get("controller_mode_initial")
+        or scorecard.get("selected_mode", "")
+        or controller_mode_realized
+    )
+    selected_score = (
+        mode_scores.get(controller_mode_initial, {}) if isinstance(mode_scores, dict) else {}
+    )
+    realized_score = (
+        mode_scores.get(controller_mode_realized, {}) if isinstance(mode_scores, dict) else {}
+    )
+    has_controller_estimate = bool(realized_score)
+    realized_expected_quality = (
+        float(realized_score.get("expected_quality", 0.0) or 0.0)
+        if has_controller_estimate
+        else 0.0
+    )
+    controller_calibration_error = (
+        round(realized_expected_quality - float(reliability_score), 4)
+        if has_controller_estimate
+        else 0.0
+    )
+    decomposition_graph = state.get("decomposition_graph", {}) or {}
+    graph_metrics = (
+        decomposition_graph.get("metrics", {}) if isinstance(decomposition_graph, dict) else {}
+    )
+    validator_audits = [
+        audit
+        for audit in (state.get("tool_audit", []) or [])
+        if isinstance(audit, dict)
+        and audit.get("tool")
+        in {"llm_claim_verifier_dual_judge", "llm_claim_repair_validator"}
+    ]
+    validator_audit = validator_audits[-1] if validator_audits else {}
+    repair_validator_audits = [
+        audit
+        for audit in (state.get("tool_audit", []) or [])
+        if isinstance(audit, dict) and audit.get("tool") == "llm_claim_repair_validator"
+    ]
+    lightweight_repair_validation_count = len(repair_validator_audits)
+    repair_validation_tokens = sum(
+        _safe_int(audit.get("total_tokens", 0), 0) for audit in repair_validator_audits
+    )
+    repair_patch_accepted_count = sum(
+        1 for audit in repair_validator_audits if bool(audit.get("repair_patch_accepted", False))
+    )
+    repair_cascade_audits = [
+        audit
+        for audit in (state.get("tool_audit", []) or [])
+        if isinstance(audit, dict) and audit.get("tool") == "repair_validator_cascade"
+    ]
+    repair_validator_escalation_count = len(repair_cascade_audits)
+    repair_cascade_score_delta = sum(
+        _safe_int(audit.get("full_validation_score", 0), 0)
+        - _safe_int(audit.get("previous_reliability_score", 0), 0)
+        for audit in repair_cascade_audits
+    )
+    secondary_judge_fallback = (
+        1 if bool(validator_audit.get("secondary_judge_fallback", False)) else 0
+    )
+    minimum_claims_required = _safe_int(
+        validator_audit.get("minimum_claims_required", 3), 3
+    )
+    claims_total = len(validation.get("claims", []) if validation else [])
+    low_claim_count_flag = (
+        1
+        if bool(validator_audit.get("low_claim_count_flag", claims_total < minimum_claims_required))
+        else 0
+    )
+    claim_count_penalty = _safe_int(validator_audit.get("claim_count_penalty", 0), 0)
+    validation_claim_coverage = round(
+        min(1.0, claims_total / max(1, minimum_claims_required)),
+        4,
+    )
+    judge_a_model = str(validator_audit.get("judge_a_model", "") or "")
+    judge_b_model = str(validator_audit.get("judge_b_model", "") or "")
+    cross_model_judging = (
+        1 if bool(validator_audit.get("cross_model_judging", False)) else 0
+    )
+    retry_decisions = [
+        decision
+        for decision in (state.get("retry_budget_decisions", []) or [])
+        if isinstance(decision, dict)
+    ]
+    retry_allowed_count = sum(1 for d in retry_decisions if bool(d.get("retry_allowed", False)))
+    retry_blocked_count = sum(
+        1
+        for d in retry_decisions
+        if not bool(d.get("retry_allowed", False)) and bool(d.get("needs_revision", False))
+    )
+    checkpoint_selection = state.get("adaptive_checkpoint_selection", {}) or {}
+    last_retry_decision = retry_decisions[-1] if retry_decisions else {}
+    adaptive_retry_enabled = 1 if bool(state.get("adaptive_retry_enabled", True)) else 0
+    adaptive_checkpoint_enabled = (
+        1 if bool(state.get("adaptive_checkpoint_enabled", True)) else 0
+    )
+    validation_snapshots = [
+        item
+        for item in (state.get("validation_snapshots", []) or [])
+        if isinstance(item, dict)
+    ]
+    initial_validation_score = (
+        _safe_int(validation_snapshots[0].get("reliability_score", reliability_score), reliability_score)
+        if validation_snapshots
+        else reliability_score
+    )
+    latest_validation_score = (
+        _safe_int(validation_snapshots[-1].get("reliability_score", reliability_score), reliability_score)
+        if validation_snapshots
+        else reliability_score
+    )
+    retry_count_value = _safe_int(state.get("retry_count", 0), 0)
+    retry_effectiveness = (
+        round(float(reliability_score - initial_validation_score), 4)
+        if retry_count_value > 0
+        else 0.0
+    )
+    raw_retry_score_delta = (
+        round(float(latest_validation_score - initial_validation_score), 4)
+        if len(validation_snapshots) > 1
+        else 0.0
+    )
+    checkpoint_saved_score = round(float(reliability_score - latest_validation_score), 4)
+    focused_repair_audits = [
+        audit
+        for audit in (state.get("tool_audit", []) or [])
+        if isinstance(audit, dict)
+        and audit.get("tool") == "focused_repair_search"
+        and audit.get("status") == "ok"
+        and str(audit.get("query", "") or "").strip()
+    ]
+    focused_repair_search_count = len(focused_repair_audits)
+    focused_repair_source_count = sum(
+        _safe_int(audit.get("source_count", 0), 0) for audit in focused_repair_audits
+    )
+    micro_repair_audits = [
+        audit
+        for audit in (state.get("tool_audit", []) or [])
+        if isinstance(audit, dict) and audit.get("tool") == "claim_micro_repair"
+    ]
+    micro_repair_count = len(micro_repair_audits)
+    micro_repair_source_count = sum(
+        _safe_int(audit.get("source_count", 0), 0) for audit in micro_repair_audits
+    )
+    micro_repair_tokens = sum(
+        _safe_int(audit.get("total_tokens", 0), 0) for audit in micro_repair_audits
+    )
+    micro_repair_search_replace_count = sum(
+        _safe_int(
+            (audit.get("repair_action_counts", {}) or {}).get("search_and_replace", 0),
+            0,
+        )
+        for audit in micro_repair_audits
+        if isinstance(audit.get("repair_action_counts", {}), dict)
+    )
+    micro_repair_qualify_remove_count = sum(
+        _safe_int(
+            (audit.get("repair_action_counts", {}) or {}).get("qualify_or_remove", 0),
+            0,
+        )
+        + _safe_int((audit.get("repair_action_counts", {}) or {}).get("remove", 0), 0)
+        for audit in micro_repair_audits
+        if isinstance(audit.get("repair_action_counts", {}), dict)
+    )
+    repair_gain_per_1k_tokens = (
+        round((raw_retry_score_delta * 1000.0) / max(1, micro_repair_tokens), 4)
+        if micro_repair_count
+        else 0.0
+    )
     metrics = {
         "strategy": strategy,
-        "controller_mode": state.get("controller_mode", "n/a"),
+        "controller_mode": controller_mode_realized,
+        "controller_mode_initial": controller_mode_initial,
+        "controller_mode_realized": controller_mode_realized,
+        "controller_escalated": 1
+        if controller_mode_initial != controller_mode_realized
+        and controller_mode_initial != "n/a"
+        and controller_mode_realized != "n/a"
+        else 0,
         "runtime_seconds": round(runtime_seconds, 3),
         "reliability_score": reliability_score,
-        "claims_total": len(validation.get("claims", []) if validation else []),
+        "claims_total": claims_total,
+        "minimum_claims_required": minimum_claims_required,
+        "validation_claim_coverage": validation_claim_coverage,
+        "low_claim_count_flag": low_claim_count_flag,
+        "claim_count_penalty": claim_count_penalty,
         "supported_ratio": ratios["supported_ratio"],
         "market_sources_count": len(state.get("market_sources", [])),
         "tool_calls": len(state.get("tool_audit", [])),
-        "retry_count": _safe_int(state.get("retry_count", 0), 0),
+        "retry_count": retry_count_value,
+        "decomposition_depth_target": _safe_int(
+            state.get("decomposition_depth_target", 0), 0
+        ),
         "decomposition_depth_realized": _safe_int(state.get("decomposition_depth_realized", 0), 0),
         "prompt_tokens_total": prompt_tokens_total,
         "completion_tokens_total": completion_tokens_total,
@@ -157,9 +353,124 @@ def _extract_metrics(state: Dict[str, Any], strategy: str, runtime_seconds: floa
         "reliability_per_second": reliability_per_second,
         "judge_agreement": float(agreement_stats.get("overall_agreement", 0.0) or 0.0),
         "judge_score_delta_abs": float(agreement_stats.get("score_delta_abs", 0.0) or 0.0),
+        "judge_a_model": judge_a_model,
+        "judge_b_model": judge_b_model,
+        "cross_model_judging": cross_model_judging,
+        "secondary_judge_fallback": secondary_judge_fallback,
         "budget_hit": 1 if budget_hit else 0,
         "budget_violation_count": budget_violation_count,
         "finished_under_budget": 0 if budget_hit else 1,
+        "controller_structural_complexity": float(
+            score_features.get("structural_complexity", 0.0) or 0.0
+        ),
+        "controller_uncertainty_need": float(
+            score_features.get("uncertainty_need", 0.0) or 0.0
+        ),
+        "controller_budget_pressure": float(scorecard.get("budget_pressure", 0.0) or 0.0)
+        if isinstance(scorecard, dict)
+        else 0.0,
+        "controller_selected_utility": float(scorecard.get("selected_utility", 0.0) or 0.0)
+        if isinstance(scorecard, dict)
+        else 0.0,
+        "controller_utility_margin": float(scorecard.get("utility_margin", 0.0) or 0.0)
+        if isinstance(scorecard, dict)
+        else 0.0,
+        "controller_expected_quality": float(
+            selected_score.get("expected_quality", 0.0) or 0.0
+        ),
+        "controller_realized_expected_quality": float(
+            realized_expected_quality
+        ),
+        "controller_calibration_error": controller_calibration_error,
+        "controller_calibration_error_abs": round(abs(controller_calibration_error), 4),
+        "controller_direct_eligible": (
+            1 if bool(scorecard.get("direct_eligible", False)) else 0
+        )
+        if isinstance(scorecard, dict)
+        else 0,
+        "controller_recursive_upfront_allowed": (
+            1 if bool(scorecard.get("recursive_upfront_allowed", False)) else 0
+        )
+        if isinstance(scorecard, dict)
+        else 0,
+        "controller_evidence_sensitive_medium": (
+            1 if bool(scorecard.get("evidence_sensitive_medium", False)) else 0
+        )
+        if isinstance(scorecard, dict)
+        else 0,
+        "controller_recursive_cost_efficient": (
+            1 if bool(scorecard.get("recursive_cost_efficient", False)) else 0
+        )
+        if isinstance(scorecard, dict)
+        else 0,
+        "controller_recursive_quality_advantage": float(
+            scorecard.get("recursive_quality_advantage", 0.0) or 0.0
+        )
+        if isinstance(scorecard, dict)
+        else 0.0,
+        "controller_recursive_marginal_quality_per_1k_token": float(
+            scorecard.get("recursive_marginal_quality_per_1k_token", 0.0) or 0.0
+        )
+        if isinstance(scorecard, dict)
+        else 0.0,
+        "controller_policy_adjustments": (
+            "|".join(scorecard.get("policy_adjustments", []) or [])
+        )
+        if isinstance(scorecard, dict) and not forced_mode_applied
+        else "",
+        "controller_policy_adjustment_count": len(
+            scorecard.get("policy_adjustments", []) or []
+        )
+        if isinstance(scorecard, dict) and not forced_mode_applied
+        else 0,
+        "adaptive_retry_enabled": adaptive_retry_enabled,
+        "adaptive_checkpoint_enabled": adaptive_checkpoint_enabled,
+        "decomposition_node_count": _safe_int(graph_metrics.get("node_count", 0), 0),
+        "decomposition_edge_count": _safe_int(graph_metrics.get("edge_count", 0), 0),
+        "decomposition_atomicity_ratio": float(
+            graph_metrics.get("atomicity_ratio", 0.0) or 0.0
+        ),
+        "validation_evidence_items_raw": _safe_int(
+            validator_audit.get("evidence_items_raw", 0), 0
+        ),
+        "validation_evidence_items_used": _safe_int(
+            validator_audit.get("evidence_items_used", 0), 0
+        ),
+        "retry_allowed_count": retry_allowed_count,
+        "retry_blocked_count": retry_blocked_count,
+        "retry_expected_gain_last": float(
+            last_retry_decision.get("retry_expected_gain", 0.0) or 0.0
+        ),
+        "retry_roi_last": float(last_retry_decision.get("retry_roi", 0.0) or 0.0),
+        "initial_validation_score": initial_validation_score,
+        "latest_validation_score": latest_validation_score,
+        "retry_effectiveness": retry_effectiveness,
+        "raw_retry_score_delta": raw_retry_score_delta,
+        "checkpoint_saved_score": checkpoint_saved_score,
+        "focused_repair_search_count": focused_repair_search_count,
+        "focused_repair_source_count": focused_repair_source_count,
+        "micro_repair_count": micro_repair_count,
+        "micro_repair_source_count": micro_repair_source_count,
+        "micro_repair_search_replace_count": micro_repair_search_replace_count,
+        "micro_repair_qualify_remove_count": micro_repair_qualify_remove_count,
+        "micro_repair_tokens": micro_repair_tokens,
+        "repair_gain_per_1k_tokens": repair_gain_per_1k_tokens,
+        "lightweight_repair_validation_count": lightweight_repair_validation_count,
+        "repair_validation_tokens": repair_validation_tokens,
+        "repair_patch_accepted_count": repair_patch_accepted_count,
+        "repair_validator_escalation_count": repair_validator_escalation_count,
+        "repair_cascade_score_delta": repair_cascade_score_delta,
+        "validation_checkpoint_count": len(validation_snapshots),
+        "best_validation_score": _safe_int(
+            checkpoint_selection.get("best_validation_score", reliability_score),
+            reliability_score,
+        ),
+        "selected_previous_checkpoint": (
+            1 if bool(checkpoint_selection.get("selected_previous_checkpoint", False)) else 0
+        ),
+        "checkpoint_score_delta_vs_current": float(
+            checkpoint_selection.get("score_delta_vs_current", 0.0) or 0.0
+        ),
     }
     return metrics
 
@@ -206,10 +517,16 @@ def _aggregate_metrics(records: List[Dict[str, Any]]) -> Dict[str, Dict[str, flo
     numeric_fields = [
         "runtime_seconds",
         "reliability_score",
+        "claims_total",
+        "minimum_claims_required",
+        "validation_claim_coverage",
+        "low_claim_count_flag",
+        "claim_count_penalty",
         "supported_ratio",
         "market_sources_count",
         "tool_calls",
         "retry_count",
+        "decomposition_depth_target",
         "decomposition_depth_realized",
         "prompt_tokens_total",
         "completion_tokens_total",
@@ -218,12 +535,61 @@ def _aggregate_metrics(records: List[Dict[str, Any]]) -> Dict[str, Dict[str, flo
         "reliability_per_second",
         "judge_agreement",
         "judge_score_delta_abs",
+        "cross_model_judging",
+        "secondary_judge_fallback",
         "reliability_gain_vs_single",
         "depth_delta_vs_single",
         "depth_vs_reliability_gain",
         "budget_hit",
         "budget_violation_count",
         "finished_under_budget",
+        "controller_escalated",
+        "controller_structural_complexity",
+        "controller_uncertainty_need",
+        "controller_budget_pressure",
+        "controller_selected_utility",
+        "controller_utility_margin",
+        "controller_expected_quality",
+        "controller_realized_expected_quality",
+        "controller_calibration_error",
+        "controller_calibration_error_abs",
+        "controller_evidence_sensitive_medium",
+        "adaptive_retry_enabled",
+        "adaptive_checkpoint_enabled",
+        "controller_recursive_cost_efficient",
+        "controller_recursive_quality_advantage",
+        "controller_recursive_marginal_quality_per_1k_token",
+        "decomposition_node_count",
+        "decomposition_edge_count",
+        "decomposition_atomicity_ratio",
+        "validation_evidence_items_raw",
+        "validation_evidence_items_used",
+        "retry_allowed_count",
+        "retry_blocked_count",
+        "retry_expected_gain_last",
+        "retry_roi_last",
+        "initial_validation_score",
+        "latest_validation_score",
+        "retry_effectiveness",
+        "raw_retry_score_delta",
+        "checkpoint_saved_score",
+        "focused_repair_search_count",
+        "focused_repair_source_count",
+        "micro_repair_count",
+        "micro_repair_source_count",
+        "micro_repair_search_replace_count",
+        "micro_repair_qualify_remove_count",
+        "micro_repair_tokens",
+        "repair_gain_per_1k_tokens",
+        "lightweight_repair_validation_count",
+        "repair_validation_tokens",
+        "repair_patch_accepted_count",
+        "repair_validator_escalation_count",
+        "repair_cascade_score_delta",
+        "validation_checkpoint_count",
+        "best_validation_score",
+        "selected_previous_checkpoint",
+        "checkpoint_score_delta_vs_current",
     ]
     aggregate: Dict[str, Dict[str, float]] = {}
     for strategy, rows in grouped.items():
@@ -233,18 +599,101 @@ def _aggregate_metrics(records: List[Dict[str, Any]]) -> Dict[str, Dict[str, flo
             strat_summary[f"{field}_mean"] = round(statistics.fmean(values), 4)
             strat_summary[f"{field}_min"] = round(min(values), 4)
             strat_summary[f"{field}_max"] = round(max(values), 4)
+            strat_summary[f"{field}_std"] = (
+                round(statistics.stdev(values), 4) if len(values) > 1 else 0.0
+            )
 
         mode_counts: Dict[str, int] = {}
+        initial_mode_counts: Dict[str, int] = {}
+        realized_mode_counts: Dict[str, int] = {}
         for row in rows:
             mode = str(row.get("controller_mode", "n/a")).strip().lower() or "n/a"
+            initial_mode = (
+                str(row.get("controller_mode_initial", mode)).strip().lower() or "n/a"
+            )
+            realized_mode = (
+                str(row.get("controller_mode_realized", mode)).strip().lower() or "n/a"
+            )
             mode_counts[mode] = mode_counts.get(mode, 0) + 1
+            initial_mode_counts[initial_mode] = initial_mode_counts.get(initial_mode, 0) + 1
+            realized_mode_counts[realized_mode] = realized_mode_counts.get(realized_mode, 0) + 1
         strat_summary["mode_distribution"] = mode_counts
+        strat_summary["initial_mode_distribution"] = initial_mode_counts
+        strat_summary["realized_mode_distribution"] = realized_mode_counts
         if rows:
             strat_summary["mode_distribution_pct"] = {
                 mode: round(count / len(rows), 4) for mode, count in mode_counts.items()
             }
+            strat_summary["initial_mode_distribution_pct"] = {
+                mode: round(count / len(rows), 4)
+                for mode, count in initial_mode_counts.items()
+            }
+            strat_summary["realized_mode_distribution_pct"] = {
+                mode: round(count / len(rows), 4)
+                for mode, count in realized_mode_counts.items()
+            }
         aggregate[strategy] = strat_summary
     return aggregate
+
+
+def _build_recommendation(aggregate: Dict[str, Dict[str, Any]]) -> Dict[str, Any] | None:
+    if not aggregate:
+        return None
+
+    quality_ranked = sorted(
+        aggregate.items(),
+        key=lambda kv: (
+            kv[1].get("budget_violation_count_mean", float("inf")),
+            -kv[1].get("reliability_score_mean", 0.0),
+            kv[1].get("runtime_seconds_mean", float("inf")),
+            kv[1].get("actual_total_tokens_mean", float("inf")),
+        ),
+    )
+    efficiency_ranked = sorted(
+        aggregate.items(),
+        key=lambda kv: (
+            kv[1].get("budget_violation_count_mean", float("inf")),
+            -kv[1].get("reliability_per_1k_actual_token_mean", 0.0),
+            -kv[1].get("reliability_score_mean", 0.0),
+            kv[1].get("actual_total_tokens_mean", float("inf")),
+        ),
+    )
+    balanced_ranked = sorted(
+        aggregate.items(),
+        key=lambda kv: (
+            kv[1].get("budget_violation_count_mean", float("inf")),
+            -(
+                0.65 * kv[1].get("reliability_score_mean", 0.0)
+                + 0.35 * kv[1].get("reliability_per_1k_actual_token_mean", 0.0)
+            ),
+            kv[1].get("actual_total_tokens_mean", float("inf")),
+        ),
+    )
+    best_name, best_stats = quality_ranked[0]
+    efficiency_name, efficiency_stats = efficiency_ranked[0]
+    balanced_name, balanced_stats = balanced_ranked[0]
+    return {
+        "best_strategy": best_name,
+        "selection_rule": (
+            "quality-first: lowest budget violations, then highest mean reliability "
+            "score, then lower runtime and actual total tokens"
+        ),
+        "stats": best_stats,
+        "best_quality_strategy": best_name,
+        "best_quality_stats": best_stats,
+        "best_efficiency_strategy": efficiency_name,
+        "best_efficiency_rule": (
+            "efficiency-first: lowest budget violations, then highest reliability "
+            "per 1K actual tokens"
+        ),
+        "best_efficiency_stats": efficiency_stats,
+        "best_balanced_strategy": balanced_name,
+        "best_balanced_rule": (
+            "balanced score: 0.65*mean reliability + 0.35*mean reliability per "
+            "1K actual tokens after budget-violation filtering"
+        ),
+        "best_balanced_stats": balanced_stats,
+    }
 
 
 def _apply_budget_posthoc(
@@ -326,14 +775,23 @@ class SingleAgentPitchRunner:
     def __init__(
         self,
         model: str = "gpt-4.1-nano",
+        secondary_judge_model: str | None = None,
         temperature: float = 0.0,
         seed: int = 42,
         enable_trends: bool = True,
         output_dir: str = "output",
     ) -> None:
         llm = ChatOpenAI(model=model, temperature=temperature, seed=seed)
+        secondary_judge_llm = (
+            ChatOpenAI(model=secondary_judge_model, temperature=temperature, seed=seed + 101)
+            if secondary_judge_model
+            else None
+        )
         self.llm = llm.with_structured_output(SingleAgentOutput, include_raw=True)
-        self.validator = SourceValidatorAgent(ChatOpenAI(model=model, temperature=temperature, seed=seed))
+        self.validator = SourceValidatorAgent(
+            ChatOpenAI(model=model, temperature=temperature, seed=seed),
+            secondary_judge_llm=secondary_judge_llm,
+        )
         self.pitch = PitchDeckGeneratorAgent(
             ChatOpenAI(model=model, temperature=temperature, seed=seed),
             output_dir=output_dir,
@@ -562,9 +1020,40 @@ class SingleAgentPitchRunner:
         return baseline_state
 
 
+def _shared_refinement_for_run(
+    *,
+    idea: str,
+    model: str,
+    temperature: float,
+    seed: int,
+    run_idx: int,
+) -> Dict[str, Any]:
+    """Generate one shared refined idea for graph-based strategy branches."""
+    llm = ChatOpenAI(model=model, temperature=temperature, seed=seed + run_idx)
+    agent = IdeaRefinementAgent(llm)
+    update = agent.run({"idea": idea, "token_usage": {}})
+    refined = str(update.get("refined_idea", "") or "")
+    usage = dict(update.get("token_usage", {}) or {})
+    return {
+        "refined_idea": refined,
+        "token_usage": usage,
+        "tool_audit": [
+            {
+                "agent": "shared_refinement",
+                "tool": "llm_idea_refinement",
+                "status": "ok",
+                "prompt_tokens": usage.get("prompt_tokens", 0),
+                "completion_tokens": usage.get("completion_tokens", 0),
+                "total_tokens": usage.get("total_tokens", 0),
+            }
+        ],
+    }
+
+
 def run_methodology_comparison(
     idea: str,
     model: str = "gpt-4.1-nano",
+    secondary_judge_model: str | None = None,
     temperature: float = 0.0,
     seed: int = 42,
     strict_tools: bool = True,
@@ -595,6 +1084,8 @@ def run_methodology_comparison(
         "fixed_direct",
         "fixed_shallow",
         "fixed_recursive",
+        "adaptive_no_retry",
+        "adaptive_no_checkpoint",
         "adaptive_controller",
     }
     invalid = [s for s in normalized if s not in allowed]
@@ -605,6 +1096,7 @@ def run_methodology_comparison(
     if "single_agent" in normalized:
         single_runner = SingleAgentPitchRunner(
             model=model,
+            secondary_judge_model=secondary_judge_model,
             temperature=temperature,
             seed=seed,
             enable_trends=enable_trends,
@@ -615,6 +1107,7 @@ def run_methodology_comparison(
     if "multi_agent" in normalized:
         multi_runner = StartupPitchRefinery(
             model=model,
+            secondary_judge_model=secondary_judge_model,
             temperature=temperature,
             seed=seed,
             strict_tools=strict_tools,
@@ -624,11 +1117,17 @@ def run_methodology_comparison(
         )
 
     adaptive_runner = None
-    if "adaptive_controller" in normalized or any(
+    adaptive_strategy_names = {
+        "adaptive_controller",
+        "adaptive_no_retry",
+        "adaptive_no_checkpoint",
+    }
+    if any(s in normalized for s in adaptive_strategy_names) or any(
         s in normalized for s in {"fixed_direct", "fixed_shallow", "fixed_recursive"}
     ):
         adaptive_runner = StartupPitchRefinery(
             model=model,
+            secondary_judge_model=secondary_judge_model,
             temperature=temperature,
             seed=seed,
             strict_tools=strict_tools,
@@ -640,8 +1139,31 @@ def run_methodology_comparison(
 
     run_rows: List[Dict[str, Any]] = []
     states: Dict[str, Dict[str, Any]] = {}
+    graph_based_strategies = {
+        "multi_agent",
+        "fixed_direct",
+        "fixed_shallow",
+        "fixed_recursive",
+        "adaptive_no_retry",
+        "adaptive_no_checkpoint",
+        "adaptive_controller",
+    }
+    use_shared_refinement = any(strategy in graph_based_strategies for strategy in normalized)
 
     for run_idx in range(compare_runs):
+        shared_refinement = (
+            _shared_refinement_for_run(
+                idea=idea,
+                model=model,
+                temperature=temperature,
+                seed=seed,
+                run_idx=run_idx,
+            )
+            if use_shared_refinement
+            else {}
+        )
+        paired_adaptive_no_retry_state: Dict[str, Any] | None = None
+        paired_adaptive_no_retry_runtime = 0.0
         for strategy in normalized:
             start = time.perf_counter()
             if strategy == "single_agent":
@@ -666,6 +1188,9 @@ def run_methodology_comparison(
                     max_token_proxy=max_token_proxy,
                     max_total_tokens=max_total_tokens,
                     max_runtime_seconds=max_runtime_seconds,
+                    shared_refined_idea=shared_refinement.get("refined_idea"),
+                    shared_refinement_token_usage=shared_refinement.get("token_usage"),
+                    shared_refinement_tool_audit=shared_refinement.get("tool_audit"),
                 )
             elif strategy in {"fixed_direct", "fixed_shallow", "fixed_recursive"}:
                 assert adaptive_runner is not None
@@ -680,19 +1205,43 @@ def run_methodology_comparison(
                     max_total_tokens=max_total_tokens,
                     max_runtime_seconds=max_runtime_seconds,
                     forced_controller_mode=forced,
+                    shared_refined_idea=shared_refinement.get("refined_idea"),
+                    shared_refinement_token_usage=shared_refinement.get("token_usage"),
+                    shared_refinement_tool_audit=shared_refinement.get("tool_audit"),
                 )
             else:
                 assert adaptive_runner is not None
-                state = adaptive_runner.run(
-                    idea=idea,
-                    thread_id=f"{thread_prefix}-{strategy}-{run_idx}",
-                    max_validation_retries=max_validation_retries,
-                    validation_threshold=validation_threshold,
-                    max_tool_calls=max_tool_calls,
-                    max_token_proxy=max_token_proxy,
-                    max_total_tokens=max_total_tokens,
-                    max_runtime_seconds=max_runtime_seconds,
-                )
+                adaptive_retry_enabled = strategy != "adaptive_no_retry"
+                adaptive_checkpoint_enabled = strategy != "adaptive_no_checkpoint"
+                if (
+                    strategy == "adaptive_controller"
+                    and paired_adaptive_no_retry_state is not None
+                ):
+                    state = adaptive_runner.continue_adaptive_from_validated_state(
+                        paired_adaptive_no_retry_state,
+                        adaptive_retry_enabled=True,
+                        adaptive_checkpoint_enabled=True,
+                    )
+                    continuation_runtime = time.perf_counter() - start
+                    start = time.perf_counter() - (
+                        paired_adaptive_no_retry_runtime + continuation_runtime
+                    )
+                else:
+                    state = adaptive_runner.run(
+                        idea=idea,
+                        thread_id=f"{thread_prefix}-{strategy}-{run_idx}",
+                        max_validation_retries=max_validation_retries,
+                        validation_threshold=validation_threshold,
+                        max_tool_calls=max_tool_calls,
+                        max_token_proxy=max_token_proxy,
+                        max_total_tokens=max_total_tokens,
+                        max_runtime_seconds=max_runtime_seconds,
+                        adaptive_retry_enabled=adaptive_retry_enabled,
+                        adaptive_checkpoint_enabled=adaptive_checkpoint_enabled,
+                        shared_refined_idea=shared_refinement.get("refined_idea"),
+                        shared_refinement_token_usage=shared_refinement.get("token_usage"),
+                        shared_refinement_tool_audit=shared_refinement.get("tool_audit"),
+                    )
 
             runtime = time.perf_counter() - start
             state = _apply_budget_posthoc(
@@ -703,6 +1252,9 @@ def run_methodology_comparison(
                 max_total_tokens=max_total_tokens,
                 max_runtime_seconds=max_runtime_seconds,
             )
+            if strategy == "adaptive_no_retry":
+                paired_adaptive_no_retry_state = dict(state)
+                paired_adaptive_no_retry_runtime = runtime
             metrics = _extract_metrics(state, strategy, runtime)
             run_key = f"{strategy}_run_{run_idx}"
             states[run_key] = state
@@ -719,28 +1271,13 @@ def run_methodology_comparison(
     _attach_relative_metrics(run_rows)
     aggregate = _aggregate_metrics([row["metrics"] for row in run_rows])
 
-    recommendation = None
-    if aggregate:
-        ranked = sorted(
-            aggregate.items(),
-            key=lambda kv: (
-                kv[1].get("budget_violation_count_mean", float("inf")),
-                -kv[1].get("reliability_score_mean", 0.0),
-                kv[1].get("runtime_seconds_mean", float("inf")),
-                kv[1].get("actual_total_tokens_mean", float("inf")),
-            ),
-        )
-        best_name, best_stats = ranked[0]
-        recommendation = {
-            "best_strategy": best_name,
-            "selection_rule": "lowest budget violations, then highest mean reliability score, then lower runtime and actual total tokens",
-            "stats": best_stats,
-        }
+    recommendation = _build_recommendation(aggregate)
 
     return {
         "metadata": {
             "idea": idea,
             "model": model,
+            "secondary_judge_model": secondary_judge_model or model,
             "temperature": temperature,
             "seed": seed,
             "strategies": normalized,
@@ -793,6 +1330,9 @@ def save_methodology_csvs(
     for row in run_rows:
         flat = {
             "idea_index": row.get("idea_index", 0),
+            "idea_id": row.get("idea_id", ""),
+            "difficulty": row.get("difficulty", ""),
+            "domain": row.get("domain", ""),
             "idea": row.get("idea", report.get("metadata", {}).get("idea", "")),
             "run_index": row.get("run_index"),
             "strategy": row.get("strategy"),
@@ -822,12 +1362,70 @@ def save_methodology_csvs(
 
     run_compact_columns = [
         "idea_index",
+        "idea_id",
+        "difficulty",
+        "domain",
         "idea",
         "run_index",
         "strategy",
+        "controller_mode_initial",
+        "controller_mode_realized",
         "controller_mode",
+        "controller_escalated",
+        "controller_structural_complexity",
+        "controller_uncertainty_need",
+        "controller_utility_margin",
+        "controller_expected_quality",
+        "controller_realized_expected_quality",
+        "controller_calibration_error",
+        "controller_calibration_error_abs",
+        "controller_direct_eligible",
+        "controller_recursive_upfront_allowed",
+        "controller_evidence_sensitive_medium",
+        "controller_recursive_cost_efficient",
+        "controller_recursive_quality_advantage",
+        "controller_recursive_marginal_quality_per_1k_token",
+        "controller_policy_adjustments",
+        "adaptive_retry_enabled",
+        "adaptive_checkpoint_enabled",
+        "decomposition_node_count",
+        "decomposition_edge_count",
+        "decomposition_atomicity_ratio",
+        "validation_evidence_items_used",
+        "retry_allowed_count",
+        "retry_blocked_count",
+        "retry_expected_gain_last",
+        "retry_roi_last",
+        "retry_effectiveness",
+        "raw_retry_score_delta",
+        "checkpoint_saved_score",
+        "focused_repair_search_count",
+        "focused_repair_source_count",
+        "micro_repair_count",
+        "micro_repair_source_count",
+        "micro_repair_search_replace_count",
+        "micro_repair_qualify_remove_count",
+        "micro_repair_tokens",
+        "repair_gain_per_1k_tokens",
+        "lightweight_repair_validation_count",
+        "repair_validation_tokens",
+        "repair_patch_accepted_count",
+        "repair_validator_escalation_count",
+        "repair_cascade_score_delta",
+        "validation_checkpoint_count",
+        "best_validation_score",
+        "selected_previous_checkpoint",
+        "checkpoint_score_delta_vs_current",
         "reliability_score",
+        "claims_total",
+        "validation_claim_coverage",
+        "low_claim_count_flag",
+        "claim_count_penalty",
         "judge_agreement",
+        "judge_a_model",
+        "judge_b_model",
+        "cross_model_judging",
+        "secondary_judge_fallback",
         "supported_ratio",
         "runtime_seconds",
         "actual_total_tokens",
@@ -845,14 +1443,70 @@ def save_methodology_csvs(
         "strategy",
         "runs",
         "reliability_score_mean",
+        "claims_total_mean",
+        "validation_claim_coverage_mean",
+        "low_claim_count_flag_mean",
+        "claim_count_penalty_mean",
         "runtime_seconds_mean",
         "actual_total_tokens_mean",
         "judge_agreement_mean",
+        "cross_model_judging_mean",
+        "secondary_judge_fallback_mean",
         "reliability_per_1k_actual_token_mean",
         "supported_ratio_mean",
+        "reliability_score_std",
+        "actual_total_tokens_std",
+        "reliability_per_1k_actual_token_std",
         "decomposition_depth_realized_mean",
         "reliability_gain_vs_single_mean",
         "budget_hit_mean",
+        "controller_escalated_mean",
+        "controller_structural_complexity_mean",
+        "controller_uncertainty_need_mean",
+        "controller_utility_margin_mean",
+        "controller_expected_quality_mean",
+        "controller_realized_expected_quality_mean",
+        "controller_calibration_error_mean",
+        "controller_calibration_error_abs_mean",
+        "controller_direct_eligible_mean",
+        "controller_recursive_upfront_allowed_mean",
+        "controller_evidence_sensitive_medium_mean",
+        "controller_recursive_cost_efficient_mean",
+        "controller_recursive_quality_advantage_mean",
+        "controller_recursive_marginal_quality_per_1k_token_mean",
+        "controller_policy_adjustment_count_mean",
+        "adaptive_retry_enabled_mean",
+        "adaptive_checkpoint_enabled_mean",
+        "decomposition_node_count_mean",
+        "decomposition_edge_count_mean",
+        "decomposition_atomicity_ratio_mean",
+        "validation_evidence_items_used_mean",
+        "retry_allowed_count_mean",
+        "retry_blocked_count_mean",
+        "retry_expected_gain_last_mean",
+        "retry_roi_last_mean",
+        "retry_effectiveness_mean",
+        "raw_retry_score_delta_mean",
+        "checkpoint_saved_score_mean",
+        "focused_repair_search_count_mean",
+        "focused_repair_source_count_mean",
+        "micro_repair_count_mean",
+        "micro_repair_source_count_mean",
+        "micro_repair_search_replace_count_mean",
+        "micro_repair_qualify_remove_count_mean",
+        "micro_repair_tokens_mean",
+        "repair_gain_per_1k_tokens_mean",
+        "lightweight_repair_validation_count_mean",
+        "repair_validation_tokens_mean",
+        "repair_patch_accepted_count_mean",
+        "repair_validator_escalation_count_mean",
+        "repair_cascade_score_delta_mean",
+        "validation_checkpoint_count_mean",
+        "best_validation_score_mean",
+        "selected_previous_checkpoint_mean",
+        "checkpoint_score_delta_vs_current_mean",
+        "initial_mode_distribution",
+        "realized_mode_distribution",
         "mode_distribution",
     ]
     agg_compact_fieldnames = [c for c in agg_compact_columns if c in agg_fieldnames]
@@ -892,12 +1546,67 @@ def save_paper_mode_exports(
     run_rows = report.get("runs", [])
     paper_columns = [
         "idea_index",
+        "idea_id",
+        "difficulty",
+        "domain",
         "idea",
         "run_index",
         "strategy",
+        "controller_mode_initial",
+        "controller_mode_realized",
         "controller_mode",
+        "controller_escalated",
+        "controller_structural_complexity",
+        "controller_uncertainty_need",
+        "controller_utility_margin",
+        "controller_expected_quality",
+        "controller_realized_expected_quality",
+        "controller_calibration_error",
+        "controller_calibration_error_abs",
+        "controller_evidence_sensitive_medium",
+        "adaptive_retry_enabled",
+        "adaptive_checkpoint_enabled",
+        "controller_recursive_cost_efficient",
+        "controller_recursive_quality_advantage",
+        "controller_recursive_marginal_quality_per_1k_token",
+        "decomposition_node_count",
+        "decomposition_edge_count",
+        "decomposition_atomicity_ratio",
+        "validation_evidence_items_used",
+        "retry_allowed_count",
+        "retry_blocked_count",
+        "retry_expected_gain_last",
+        "retry_roi_last",
+        "retry_effectiveness",
+        "raw_retry_score_delta",
+        "checkpoint_saved_score",
+        "focused_repair_search_count",
+        "focused_repair_source_count",
+        "micro_repair_count",
+        "micro_repair_source_count",
+        "micro_repair_search_replace_count",
+        "micro_repair_qualify_remove_count",
+        "micro_repair_tokens",
+        "repair_gain_per_1k_tokens",
+        "lightweight_repair_validation_count",
+        "repair_validation_tokens",
+        "repair_patch_accepted_count",
+        "repair_validator_escalation_count",
+        "repair_cascade_score_delta",
+        "validation_checkpoint_count",
+        "best_validation_score",
+        "selected_previous_checkpoint",
+        "checkpoint_score_delta_vs_current",
         "reliability_score",
+        "claims_total",
+        "validation_claim_coverage",
+        "low_claim_count_flag",
+        "claim_count_penalty",
         "judge_agreement",
+        "judge_a_model",
+        "judge_b_model",
+        "cross_model_judging",
+        "secondary_judge_fallback",
         "supported_ratio",
         "runtime_seconds",
         "actual_total_tokens",
@@ -911,12 +1620,97 @@ def save_paper_mode_exports(
         metrics = row.get("metrics", {})
         flat = {
             "idea_index": row.get("idea_index", 0),
+            "idea_id": row.get("idea_id", ""),
+            "difficulty": row.get("difficulty", ""),
+            "domain": row.get("domain", ""),
             "idea": row.get("idea", report.get("metadata", {}).get("idea", "")),
             "run_index": row.get("run_index"),
             "strategy": row.get("strategy"),
+            "controller_mode_initial": metrics.get("controller_mode_initial", "n/a"),
+            "controller_mode_realized": metrics.get("controller_mode_realized", "n/a"),
             "controller_mode": metrics.get("controller_mode", "n/a"),
+            "controller_escalated": metrics.get("controller_escalated", 0),
+            "controller_structural_complexity": metrics.get(
+                "controller_structural_complexity", 0.0
+            ),
+            "controller_uncertainty_need": metrics.get("controller_uncertainty_need", 0.0),
+            "controller_utility_margin": metrics.get("controller_utility_margin", 0.0),
+            "controller_expected_quality": metrics.get("controller_expected_quality", 0.0),
+            "controller_realized_expected_quality": metrics.get(
+                "controller_realized_expected_quality", 0.0
+            ),
+            "controller_calibration_error": metrics.get(
+                "controller_calibration_error", 0.0
+            ),
+            "controller_calibration_error_abs": metrics.get(
+                "controller_calibration_error_abs", 0.0
+            ),
+            "controller_evidence_sensitive_medium": metrics.get(
+                "controller_evidence_sensitive_medium", 0
+            ),
+            "adaptive_retry_enabled": metrics.get("adaptive_retry_enabled", 1),
+            "adaptive_checkpoint_enabled": metrics.get("adaptive_checkpoint_enabled", 1),
+            "controller_recursive_cost_efficient": metrics.get(
+                "controller_recursive_cost_efficient", 0
+            ),
+            "controller_recursive_quality_advantage": metrics.get(
+                "controller_recursive_quality_advantage", 0.0
+            ),
+            "controller_recursive_marginal_quality_per_1k_token": metrics.get(
+                "controller_recursive_marginal_quality_per_1k_token", 0.0
+            ),
+            "decomposition_node_count": metrics.get("decomposition_node_count", 0),
+            "decomposition_edge_count": metrics.get("decomposition_edge_count", 0),
+            "decomposition_atomicity_ratio": metrics.get(
+                "decomposition_atomicity_ratio", 0.0
+            ),
+            "validation_evidence_items_used": metrics.get(
+                "validation_evidence_items_used", 0
+            ),
+            "retry_allowed_count": metrics.get("retry_allowed_count", 0),
+            "retry_blocked_count": metrics.get("retry_blocked_count", 0),
+            "retry_expected_gain_last": metrics.get("retry_expected_gain_last", 0.0),
+            "retry_roi_last": metrics.get("retry_roi_last", 0.0),
+            "retry_effectiveness": metrics.get("retry_effectiveness", 0.0),
+            "raw_retry_score_delta": metrics.get("raw_retry_score_delta", 0.0),
+            "checkpoint_saved_score": metrics.get("checkpoint_saved_score", 0.0),
+            "focused_repair_search_count": metrics.get("focused_repair_search_count", 0),
+            "focused_repair_source_count": metrics.get("focused_repair_source_count", 0),
+            "micro_repair_count": metrics.get("micro_repair_count", 0),
+            "micro_repair_source_count": metrics.get("micro_repair_source_count", 0),
+            "micro_repair_search_replace_count": metrics.get(
+                "micro_repair_search_replace_count", 0
+            ),
+            "micro_repair_qualify_remove_count": metrics.get(
+                "micro_repair_qualify_remove_count", 0
+            ),
+            "micro_repair_tokens": metrics.get("micro_repair_tokens", 0),
+            "repair_gain_per_1k_tokens": metrics.get("repair_gain_per_1k_tokens", 0.0),
+            "lightweight_repair_validation_count": metrics.get(
+                "lightweight_repair_validation_count", 0
+            ),
+            "repair_validation_tokens": metrics.get("repair_validation_tokens", 0),
+            "repair_patch_accepted_count": metrics.get("repair_patch_accepted_count", 0),
+            "repair_validator_escalation_count": metrics.get(
+                "repair_validator_escalation_count", 0
+            ),
+            "repair_cascade_score_delta": metrics.get("repair_cascade_score_delta", 0),
+            "validation_checkpoint_count": metrics.get("validation_checkpoint_count", 0),
+            "best_validation_score": metrics.get("best_validation_score", 0),
+            "selected_previous_checkpoint": metrics.get("selected_previous_checkpoint", 0),
+            "checkpoint_score_delta_vs_current": metrics.get(
+                "checkpoint_score_delta_vs_current", 0.0
+            ),
             "reliability_score": metrics.get("reliability_score", 0),
+            "claims_total": metrics.get("claims_total", 0),
+            "validation_claim_coverage": metrics.get("validation_claim_coverage", 0.0),
+            "low_claim_count_flag": metrics.get("low_claim_count_flag", 0),
+            "claim_count_penalty": metrics.get("claim_count_penalty", 0),
             "judge_agreement": metrics.get("judge_agreement", 0.0),
+            "judge_a_model": metrics.get("judge_a_model", ""),
+            "judge_b_model": metrics.get("judge_b_model", ""),
+            "cross_model_judging": metrics.get("cross_model_judging", 0),
+            "secondary_judge_fallback": metrics.get("secondary_judge_fallback", 0),
             "supported_ratio": metrics.get("supported_ratio", 0.0),
             "runtime_seconds": metrics.get("runtime_seconds", 0.0),
             "actual_total_tokens": metrics.get("actual_total_tokens", 0),
@@ -942,7 +1736,15 @@ def save_paper_mode_exports(
         compact_aggregate[strategy] = {
             "runs": stats.get("runs"),
             "reliability_score_mean": stats.get("reliability_score_mean"),
+            "claims_total_mean": stats.get("claims_total_mean"),
+            "validation_claim_coverage_mean": stats.get(
+                "validation_claim_coverage_mean"
+            ),
+            "low_claim_count_flag_mean": stats.get("low_claim_count_flag_mean"),
+            "claim_count_penalty_mean": stats.get("claim_count_penalty_mean"),
             "judge_agreement_mean": stats.get("judge_agreement_mean"),
+            "cross_model_judging_mean": stats.get("cross_model_judging_mean"),
+            "secondary_judge_fallback_mean": stats.get("secondary_judge_fallback_mean"),
             "supported_ratio_mean": stats.get("supported_ratio_mean"),
             "runtime_seconds_mean": stats.get("runtime_seconds_mean"),
             "actual_total_tokens_mean": stats.get("actual_total_tokens_mean"),
@@ -953,6 +1755,94 @@ def save_paper_mode_exports(
                 "decomposition_depth_realized_mean"
             ),
             "budget_hit_mean": stats.get("budget_hit_mean"),
+            "controller_escalated_mean": stats.get("controller_escalated_mean"),
+            "controller_structural_complexity_mean": stats.get(
+                "controller_structural_complexity_mean"
+            ),
+            "controller_uncertainty_need_mean": stats.get(
+                "controller_uncertainty_need_mean"
+            ),
+            "controller_utility_margin_mean": stats.get("controller_utility_margin_mean"),
+            "controller_expected_quality_mean": stats.get(
+                "controller_expected_quality_mean"
+            ),
+            "controller_realized_expected_quality_mean": stats.get(
+                "controller_realized_expected_quality_mean"
+            ),
+            "controller_calibration_error_mean": stats.get(
+                "controller_calibration_error_mean"
+            ),
+            "controller_calibration_error_abs_mean": stats.get(
+                "controller_calibration_error_abs_mean"
+            ),
+            "controller_evidence_sensitive_medium_mean": stats.get(
+                "controller_evidence_sensitive_medium_mean"
+            ),
+            "adaptive_retry_enabled_mean": stats.get("adaptive_retry_enabled_mean"),
+            "adaptive_checkpoint_enabled_mean": stats.get(
+                "adaptive_checkpoint_enabled_mean"
+            ),
+            "controller_recursive_cost_efficient_mean": stats.get(
+                "controller_recursive_cost_efficient_mean"
+            ),
+            "controller_recursive_quality_advantage_mean": stats.get(
+                "controller_recursive_quality_advantage_mean"
+            ),
+            "controller_recursive_marginal_quality_per_1k_token_mean": stats.get(
+                "controller_recursive_marginal_quality_per_1k_token_mean"
+            ),
+            "decomposition_node_count_mean": stats.get("decomposition_node_count_mean"),
+            "decomposition_edge_count_mean": stats.get("decomposition_edge_count_mean"),
+            "decomposition_atomicity_ratio_mean": stats.get(
+                "decomposition_atomicity_ratio_mean"
+            ),
+            "validation_evidence_items_used_mean": stats.get(
+                "validation_evidence_items_used_mean"
+            ),
+            "retry_allowed_count_mean": stats.get("retry_allowed_count_mean"),
+            "retry_blocked_count_mean": stats.get("retry_blocked_count_mean"),
+            "retry_expected_gain_last_mean": stats.get("retry_expected_gain_last_mean"),
+            "retry_roi_last_mean": stats.get("retry_roi_last_mean"),
+            "retry_effectiveness_mean": stats.get("retry_effectiveness_mean"),
+            "raw_retry_score_delta_mean": stats.get("raw_retry_score_delta_mean"),
+            "checkpoint_saved_score_mean": stats.get("checkpoint_saved_score_mean"),
+            "focused_repair_search_count_mean": stats.get("focused_repair_search_count_mean"),
+            "focused_repair_source_count_mean": stats.get("focused_repair_source_count_mean"),
+            "micro_repair_count_mean": stats.get("micro_repair_count_mean"),
+            "micro_repair_source_count_mean": stats.get("micro_repair_source_count_mean"),
+            "micro_repair_search_replace_count_mean": stats.get(
+                "micro_repair_search_replace_count_mean"
+            ),
+            "micro_repair_qualify_remove_count_mean": stats.get(
+                "micro_repair_qualify_remove_count_mean"
+            ),
+            "micro_repair_tokens_mean": stats.get("micro_repair_tokens_mean"),
+            "repair_gain_per_1k_tokens_mean": stats.get("repair_gain_per_1k_tokens_mean"),
+            "lightweight_repair_validation_count_mean": stats.get(
+                "lightweight_repair_validation_count_mean"
+            ),
+            "repair_validation_tokens_mean": stats.get("repair_validation_tokens_mean"),
+            "repair_patch_accepted_count_mean": stats.get(
+                "repair_patch_accepted_count_mean"
+            ),
+            "repair_validator_escalation_count_mean": stats.get(
+                "repair_validator_escalation_count_mean"
+            ),
+            "repair_cascade_score_delta_mean": stats.get(
+                "repair_cascade_score_delta_mean"
+            ),
+            "validation_checkpoint_count_mean": stats.get(
+                "validation_checkpoint_count_mean"
+            ),
+            "best_validation_score_mean": stats.get("best_validation_score_mean"),
+            "selected_previous_checkpoint_mean": stats.get(
+                "selected_previous_checkpoint_mean"
+            ),
+            "checkpoint_score_delta_vs_current_mean": stats.get(
+                "checkpoint_score_delta_vs_current_mean"
+            ),
+            "initial_mode_distribution": stats.get("initial_mode_distribution"),
+            "realized_mode_distribution": stats.get("realized_mode_distribution"),
             "mode_distribution": stats.get("mode_distribution"),
         }
 
@@ -960,13 +1850,65 @@ def save_paper_mode_exports(
         "metadata": report.get("metadata", {}),
         "evaluation_primary_metrics": [
             "reliability_score",
+            "claims_total",
+            "validation_claim_coverage",
+            "low_claim_count_flag",
+            "claim_count_penalty",
             "judge_agreement",
+            "judge_a_model",
+            "judge_b_model",
+            "cross_model_judging",
+            "secondary_judge_fallback",
             "supported_ratio",
             "runtime_seconds",
             "actual_total_tokens",
             "reliability_per_1k_actual_token",
             "decomposition_depth_realized",
             "budget_hit",
+            "controller_mode_initial",
+            "controller_mode_realized",
+            "controller_escalated",
+            "controller_structural_complexity",
+            "controller_uncertainty_need",
+            "controller_utility_margin",
+            "controller_expected_quality",
+            "controller_realized_expected_quality",
+            "controller_calibration_error",
+            "controller_calibration_error_abs",
+            "controller_evidence_sensitive_medium",
+            "adaptive_retry_enabled",
+            "adaptive_checkpoint_enabled",
+            "controller_recursive_cost_efficient",
+            "controller_recursive_quality_advantage",
+            "controller_recursive_marginal_quality_per_1k_token",
+            "decomposition_node_count",
+            "decomposition_edge_count",
+            "decomposition_atomicity_ratio",
+            "validation_evidence_items_used",
+            "retry_allowed_count",
+            "retry_blocked_count",
+            "retry_expected_gain_last",
+            "retry_roi_last",
+            "retry_effectiveness",
+            "raw_retry_score_delta",
+            "checkpoint_saved_score",
+            "focused_repair_search_count",
+        "focused_repair_source_count",
+        "micro_repair_count",
+        "micro_repair_source_count",
+        "micro_repair_search_replace_count",
+        "micro_repair_qualify_remove_count",
+        "micro_repair_tokens",
+        "repair_gain_per_1k_tokens",
+        "lightweight_repair_validation_count",
+        "repair_validation_tokens",
+        "repair_patch_accepted_count",
+        "repair_validator_escalation_count",
+        "repair_cascade_score_delta",
+        "validation_checkpoint_count",
+        "best_validation_score",
+        "selected_previous_checkpoint",
+        "checkpoint_score_delta_vs_current",
         ],
         "aggregate": compact_aggregate,
         "recommendation": report.get("recommendation"),
@@ -979,9 +1921,42 @@ def save_paper_mode_exports(
     }
 
 
+def _normalize_idea_records(ideas: List[Any]) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for idx, item in enumerate(ideas):
+        if isinstance(item, dict):
+            idea = str(item.get("idea") or item.get("prompt") or "").strip()
+            if not idea:
+                continue
+            records.append(
+                {
+                    "idea_index": idx,
+                    "idea_id": str(item.get("idea_id") or f"idea_{idx:03d}").strip(),
+                    "difficulty": str(item.get("difficulty") or "unspecified").strip(),
+                    "domain": str(item.get("domain") or "unspecified").strip(),
+                    "idea": idea,
+                }
+            )
+            continue
+
+        idea = str(item).strip()
+        if idea:
+            records.append(
+                {
+                    "idea_index": idx,
+                    "idea_id": f"idea_{idx:03d}",
+                    "difficulty": "unspecified",
+                    "domain": "unspecified",
+                    "idea": idea,
+                }
+            )
+    return records
+
+
 def run_methodology_batch_comparison(
-    ideas: List[str],
+    ideas: List[Any],
     model: str = "gpt-4.1-nano",
+    secondary_judge_model: str | None = None,
     temperature: float = 0.0,
     seed: int = 42,
     strict_tools: bool = True,
@@ -998,18 +1973,20 @@ def run_methodology_batch_comparison(
     thread_prefix: str = "methodology",
     output_dir: str = "output",
 ) -> Dict[str, Any]:
-    cleaned_ideas = [i.strip() for i in ideas if i and i.strip()]
-    if not cleaned_ideas:
+    idea_records = _normalize_idea_records(ideas)
+    if not idea_records:
         raise ValueError("No ideas provided for batch comparison.")
 
     per_idea_reports: List[Dict[str, Any]] = []
     all_rows: List[Dict[str, Any]] = []
     all_states: Dict[str, Dict[str, Any]] = {}
 
-    for idx, idea in enumerate(cleaned_ideas):
+    for idx, idea_record in enumerate(idea_records):
+        idea = idea_record["idea"]
         report = run_methodology_comparison(
             idea=idea,
             model=model,
+            secondary_judge_model=secondary_judge_model,
             temperature=temperature,
             seed=seed,
             strict_tools=strict_tools,
@@ -1029,6 +2006,9 @@ def run_methodology_batch_comparison(
         per_idea_reports.append(
             {
                 "idea_index": idx,
+                "idea_id": idea_record["idea_id"],
+                "difficulty": idea_record["difficulty"],
+                "domain": idea_record["domain"],
                 "idea": idea,
                 "aggregate": report.get("aggregate", {}),
                 "recommendation": report.get("recommendation"),
@@ -1037,6 +2017,9 @@ def run_methodology_batch_comparison(
         for row in report.get("runs", []):
             copied = dict(row)
             copied["idea_index"] = idx
+            copied["idea_id"] = idea_record["idea_id"]
+            copied["difficulty"] = idea_record["difficulty"]
+            copied["domain"] = idea_record["domain"]
             copied["idea"] = idea
             all_rows.append(copied)
         for key, state in report.get("states", {}).items():
@@ -1044,29 +2027,15 @@ def run_methodology_batch_comparison(
 
     _attach_relative_metrics(all_rows)
     aggregate = _aggregate_metrics([row["metrics"] for row in all_rows])
-    recommendation = None
-    if aggregate:
-        ranked = sorted(
-            aggregate.items(),
-            key=lambda kv: (
-                kv[1].get("budget_violation_count_mean", float("inf")),
-                -kv[1].get("reliability_score_mean", 0.0),
-                kv[1].get("runtime_seconds_mean", float("inf")),
-                kv[1].get("actual_total_tokens_mean", float("inf")),
-            ),
-        )
-        best_name, best_stats = ranked[0]
-        recommendation = {
-            "best_strategy": best_name,
-            "selection_rule": "lowest budget violations, then highest mean reliability score, then lower runtime and actual total tokens",
-            "stats": best_stats,
-        }
+    recommendation = _build_recommendation(aggregate)
 
     return {
         "metadata": {
-            "ideas_count": len(cleaned_ideas),
-            "ideas": cleaned_ideas,
+            "ideas_count": len(idea_records),
+            "ideas": [record["idea"] for record in idea_records],
+            "idea_records": idea_records,
             "model": model,
+            "secondary_judge_model": secondary_judge_model or model,
             "temperature": temperature,
             "seed": seed,
             "strategies": (

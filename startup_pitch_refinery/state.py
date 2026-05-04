@@ -14,16 +14,27 @@ class PitchState(BaseModel):
     controller_rationale: Optional[str] = None
     controller_expected_cost: Dict[str, Any] = Field(default_factory=dict)
     controller_budget_snapshot: Dict[str, Any] = Field(default_factory=dict)
+    controller_scorecard: Dict[str, Any] = Field(default_factory=dict)
     controller_decisions: List[Dict[str, Any]] = Field(default_factory=list)
+    adaptive_retry_enabled: bool = True
+    adaptive_checkpoint_enabled: bool = True
+    decomposition_graph: Dict[str, Any] = Field(default_factory=dict)
+    retry_budget_decisions: List[Dict[str, Any]] = Field(default_factory=list)
     decomposition_depth_target: Optional[int] = None
     decomposition_depth_realized: Optional[int] = None
     task_plan: Optional[List[str]] = None
     refined_idea: Optional[str] = None
+    shared_refinement_locked: bool = False
     market_analysis: Optional[str] = None
     market_sources: List[str] = Field(default_factory=list)
     market_evidence: List[Dict[str, Any]] = Field(default_factory=list)
+    market_repair_context: Dict[str, Any] = Field(default_factory=dict)
+    market_repair_history: List[Dict[str, Any]] = Field(default_factory=list)
     trend_signals: Dict[str, Any] = Field(default_factory=dict)
     validation_report: Optional[Dict[str, Any]] = None
+    validation_snapshots: List[Dict[str, Any]] = Field(default_factory=list)
+    selected_validation_checkpoint: Dict[str, Any] = Field(default_factory=dict)
+    adaptive_checkpoint_selection: Dict[str, Any] = Field(default_factory=dict)
     validated_market_analysis: Optional[str] = None
     business_model: Optional[str] = None
     financial_assumptions: Dict[str, Any] = Field(default_factory=dict)

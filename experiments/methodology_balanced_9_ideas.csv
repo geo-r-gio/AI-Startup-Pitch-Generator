@@ -1,0 +1,10 @@
+idea_id,difficulty,domain,idea
+easy_001,easy,consumer,"A mobile app that helps college students organize study sessions and track assignment deadlines."
+easy_002,easy,health_wellness,"A simple AI habit coach that reminds users to drink water, stretch, and sleep on time."
+easy_003,easy,education,"A flashcard generator that turns lecture notes into practice questions for high school students."
+medium_001,medium,b2b_saas,"An AI customer support copilot for small ecommerce brands that drafts replies, tags tickets, and detects refund-risk cases."
+medium_002,medium,legaltech,"An AI contract review assistant for small legal teams that flags risky clauses and summarizes obligations."
+medium_003,medium,healthcare_ops,"A scheduling optimization platform that reduces patient no-shows for outpatient clinics using reminders and risk scoring."
+hard_001,hard,regulated_healthcare,"A HIPAA-aware multi-agent platform that coordinates insurance pre-authorization, patient scheduling, and clinical documentation for specialty clinics."
+hard_002,hard,enterprise_compliance,"An AI governance platform that monitors enterprise AI tool usage, maps regulatory risk, and produces audit-ready compliance reports."
+hard_003,hard,supply_chain,"A cross-border supply-chain risk platform that predicts shipment delays using vendor data, weather, customs rules, and geopolitical signals."

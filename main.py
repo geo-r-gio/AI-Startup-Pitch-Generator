@@ -1,4 +1,5 @@
 import argparse
+import csv
 import datetime as dt
 import json
 import os
@@ -48,6 +49,34 @@ def _update_latest_symlink(target_dir: Path) -> None:
     latest_link.symlink_to(target_dir.resolve(), target_is_directory=True)
 
 
+def _load_ideas_file(path: Path):
+    """Load either newline-delimited ideas or a CSV prompt suite."""
+    text = path.read_text(encoding="utf-8")
+    if path.suffix.lower() == ".csv":
+        rows = list(csv.DictReader(text.splitlines()))
+        ideas = []
+        for idx, row in enumerate(rows):
+            idea = (row.get("idea") or row.get("prompt") or "").strip()
+            if not idea:
+                continue
+            ideas.append(
+                {
+                    "idea_index": idx,
+                    "idea_id": (row.get("idea_id") or f"idea_{idx:03d}").strip(),
+                    "difficulty": (row.get("difficulty") or "unspecified").strip(),
+                    "domain": (row.get("domain") or "unspecified").strip(),
+                    "idea": idea,
+                }
+            )
+        return ideas
+
+    return [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+
 def main() -> None:
     load_dotenv()
 
@@ -77,6 +106,12 @@ def main() -> None:
         type=str,
         default="gpt-4.1-nano",
         help="OpenAI chat model name",
+    )
+    parser.add_argument(
+        "--secondary-judge-model",
+        type=str,
+        default="",
+        help="Optional model for Judge B in dual-judge validation. Defaults to --model.",
     )
     parser.add_argument(
         "--temperature",
@@ -175,7 +210,8 @@ def main() -> None:
         default="single_agent,fixed_shallow,fixed_recursive,adaptive_controller",
         help=(
             "Comma-separated strategies for compare mode. "
-            "Allowed: single_agent,multi_agent,fixed_direct,fixed_shallow,fixed_recursive,adaptive_controller"
+            "Allowed: single_agent,multi_agent,fixed_direct,fixed_shallow,"
+            "fixed_recursive,adaptive_no_retry,adaptive_no_checkpoint,adaptive_controller"
         ),
     )
     parser.add_argument(
@@ -348,14 +384,11 @@ def main() -> None:
             ideas_path = Path(ideas_file)
             if not ideas_path.exists():
                 raise FileNotFoundError(f"Ideas file not found: {ideas_path}")
-            ideas = [
-                line.strip()
-                for line in ideas_path.read_text(encoding="utf-8").splitlines()
-                if line.strip() and not line.strip().startswith("#")
-            ]
+            ideas = _load_ideas_file(ideas_path)
             report = run_methodology_batch_comparison(
                 ideas=ideas,
                 model=args.model,
+                secondary_judge_model=args.secondary_judge_model.strip() or None,
                 temperature=args.temperature,
                 seed=args.seed,
                 strict_tools=not args.no_strict_tools,
@@ -376,6 +409,7 @@ def main() -> None:
             report = run_methodology_comparison(
                 idea=args.idea,
                 model=args.model,
+                secondary_judge_model=args.secondary_judge_model.strip() or None,
                 temperature=args.temperature,
                 seed=args.seed,
                 strict_tools=not args.no_strict_tools,
@@ -469,6 +503,7 @@ def main() -> None:
 
     app = StartupPitchRefinery(
         model=args.model,
+        secondary_judge_model=args.secondary_judge_model.strip() or None,
         temperature=args.temperature,
         seed=args.seed,
         strict_tools=not args.no_strict_tools,
@@ -505,7 +540,8 @@ def main() -> None:
     print("\n=== Controller Decision ===")
     if state.get("controller_mode"):
         print(
-            f"Mode: {state.get('controller_mode')} | "
+            f"Initial Mode: {state.get('controller_mode_initial', state.get('controller_mode'))} | "
+            f"Realized Mode: {state.get('controller_mode')} | "
             f"Confidence: {state.get('controller_confidence')} | "
             f"Target Depth: {state.get('decomposition_depth_target')} | "
             f"Realized Depth: {state.get('decomposition_depth_realized')}"

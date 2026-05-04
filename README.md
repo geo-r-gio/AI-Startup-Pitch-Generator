@@ -120,31 +120,43 @@ Methodology comparison mode (single-agent baseline vs fixed/adaptive multi-agent
   --compare-output output/methodology_comparison.json
 ```
 
-Batch methodology comparison over multiple ideas (newline-delimited file) with CSV exports:
+Batch methodology comparison over multiple ideas with CSV exports:
 
 ```bash
 .venv/bin/python main.py \
   --mode compare \
   --idea "placeholder" \
-  --ideas-file /tmp/method_ideas.txt \
-  --compare-strategies "single_agent,multi_agent,adaptive_controller" \
-  --compare-runs 2 \
+  --ideas-file prompts/methodology_ideas_v1.csv \
+  --compare-strategies "single_agent,fixed_shallow,fixed_recursive,adaptive_controller" \
+  --compare-runs 5 \
+  --disable-image-fetch \
+  --disable-trends \
+  --max-tool-calls 12 \
+  --max-total-tokens 18000 \
+  --max-runtime-seconds 180 \
+  --validation-threshold 75 \
+  --max-validation-retries 2 \
   --compare-export-csv \
-  --compare-output output/methodology_batch.json \
-  --runs-csv-output output/methodology_runs.csv \
-  --aggregate-csv-output output/methodology_aggregate.csv \
-  --best-summary-output output/methodology_best_summary.json
+  --paper-mode \
+  --thread-id methodology-final-v1
 ```
 
 Notes:
 - `--compare-runs` repeats each strategy to reduce variance.
+- `--ideas-file` accepts either newline-delimited prompts or a CSV prompt suite with `idea_id`, `difficulty`, `domain`, and `idea` columns.
+- `prompts/methodology_ideas_v1.csv` is the fixed benchmark-style prompt suite for methodology experiments.
 - `--compare-generate-ppt` is optional and slower; compare mode defaults to metrics-first.
 - Budget flags (`--max-tool-calls`, `--max-token-proxy`, `--max-total-tokens`, `--max-runtime-seconds`) are applied uniformly across strategies for matched-budget comparisons.
-- Adaptive controller is budget-aware and can override an initially chosen mode (`direct/shallow/recursive`) when remaining budget is tight.
-- Comparison report includes run-level metrics (reliability, latency, source count, token proxy, retries, retry effectiveness, realized decomposition depth, depth-vs-reliability gain, budget-hit indicators, and reliability-per-cost metrics) and strategy-level aggregates (including mode distribution).
+- Adaptive controller uses a persisted scorecard to choose `direct`, `shallow`, or `recursive`: `utility(mode)=expected_quality(mode)-lambda_cost*normalized_cost(mode)*100+llm_advisory_bonus`.
+- The scorecard estimates expected quality from structural complexity, uncertainty, evidence need, and workflow coupling; it estimates cost from deterministic mode priors scaled by complexity and current budget pressure.
+- For high-assurance experiments (`--validation-threshold >= 75`), the controller is quality-first but feedback-driven: `direct` is only eligible for very low-risk cases or tight budgets, most tasks start with `shallow`, and `shallow` can escalate to `recursive` only after validation fails and budget remains. These policy adjustments are exported in the compact CSV.
+- The selected decomposition is saved as an inspectable graph `D=(V,E,tau,rho)`, where nodes are subtasks, edges are dependencies, `tau` is each subtask interface, and `rho` is the assigned executor.
+- Search snippets passed to synthesis and validation are capped by mode and remaining budget so the dual-judge evaluator does not accidentally dominate token cost.
+- Recursive retry is budget-gated: another market/validation pass only runs when enough total-token, tool-call, and runtime budget remains for the retry plus a reserve for business-model generation.
+- Comparison report includes run-level metrics (reliability, judge agreement, supported-claim ratio, latency, actual token usage, retries, budget-hit indicators, reliability-per-cost metrics, controller complexity/uncertainty, utility margin, and decomposition graph metrics) and strategy-level aggregates (including mode distribution).
 - Token accounting now includes both:
   - actual OpenAI token usage (`prompt_tokens_total`, `completion_tokens_total`, `actual_total_tokens`)
-  - deterministic token proxy (`token_proxy_total`) for backward-compatible budget heuristics
+  - deterministic token proxy in saved state (`token_proxy_current`) for backward-compatible budget heuristics
 - When `--compare-export-csv` is enabled, compact CSVs are also generated automatically:
   - `<runs_csv_output_stem>_compact.csv`
   - `<aggregate_csv_output_stem>_compact.csv`
