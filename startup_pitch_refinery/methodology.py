@@ -13,6 +13,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from startup_pitch_refinery.agents import (
+    AdaptiveControllerAgent,
     BayesianRetryPolicy,
     IdeaRefinementAgent,
     PitchDeckGeneratorAgent,
@@ -91,10 +92,29 @@ POLICY_CALIBRATION_COLUMNS = [
     "expected_gain",
     "expected_tokens",
     "expected_seconds",
+    "gain_kappa",
+    "token_kappa",
+    "seconds_kappa",
     "mean_observed_gain",
     "mean_observed_tokens",
+    "mean_observed_roi_per_1k",
     "mean_terminal_utility_delta",
+    "mean_terminal_utility_per_1k_tokens",
 ]
+
+DIRECT_ENTRY_PRIORS = {
+    # Priors are deliberately conservative: a direct precheck only saves tokens
+    # when its probability of passing validation is high enough to offset the
+    # failed-direct escalation cost.
+    "simple_plain": {"alpha": 3.0, "beta": 4.0, "direct_tokens": 5600.0, "shallow_tokens": 9300.0},
+    "simple_workflow": {"alpha": 2.0, "beta": 4.0, "direct_tokens": 5600.0, "shallow_tokens": 9300.0},
+    "moderate": {"alpha": 2.0, "beta": 5.0, "direct_tokens": 5600.0, "shallow_tokens": 9300.0},
+    "high_complexity": {"alpha": 2.0, "beta": 6.0, "direct_tokens": 5600.0, "shallow_tokens": 9300.0},
+}
+
+DIRECT_ENTRY_DEFAULT_PRIOR = DIRECT_ENTRY_PRIORS["moderate"]
+DIRECT_ENTRY_MIN_ACCEPTANCE = 0.75
+DIRECT_ENTRY_MIN_NET_TOKENS = 1000.0
 
 
 CORE_NUMERIC_FIELDS = [
@@ -139,6 +159,15 @@ CORE_NUMERIC_FIELDS = [
     "budget_violation_count",
     "finished_under_budget",
     "controller_escalated",
+    "direct_precheck_allowed",
+    "direct_precheck_skipped",
+    "direct_precheck_escalated",
+    "direct_precheck_accepted",
+    "direct_precheck_score",
+    "direct_precheck_incremental_tokens",
+    "direct_precheck_gate_probability",
+    "direct_precheck_gate_threshold",
+    "direct_precheck_gate_expected_net_tokens",
     "controller_structural_complexity",
     "controller_uncertainty_need",
     "controller_budget_pressure",
@@ -182,6 +211,7 @@ CORE_NUMERIC_FIELDS = [
     "retry_policy_blocked_by_expected_utility_count_last",
     "retry_policy_blocked_by_posterior_count_last",
     "retry_policy_blocked_by_token_reserve_count_last",
+    "retry_policy_blocked_by_threshold_crossing_count_last",
     "baseline_shallow_reliability",
     "baseline_shallow_tokens",
     "delta_vs_shared_shallow",
@@ -197,6 +227,7 @@ CORE_NUMERIC_FIELDS = [
     "retrieval_diagnostic_count",
     "retrieval_diagnostic_mean_score",
     "retrieval_diagnostic_max_score",
+    "coverage_enhancement_target_count",
     "retrieval_strong_evidence_count",
     "retrieval_medium_or_better_count",
     "evidence_probe_count",
@@ -214,6 +245,13 @@ CORE_NUMERIC_FIELDS = [
     "selected_action_ucb_bonus",
     "selected_action_n_empirical",
     "selected_action_roi_per_1k",
+    "selected_action_large_deficit_incremental_exception",
+    "selected_action_threshold_crossing_repair_exception",
+    "selected_action_source_backed_material_repair_exception",
+    "selected_action_coverage_addition_exception",
+    "selected_action_token_reserve_exception",
+    "selected_action_effective_tail_token_reserve",
+    "selected_action_reserve_after_expected_repair",
     "policy_repair_observations",
     "policy_repair_accepted_total",
     "policy_repair_rejected_total",
@@ -225,9 +263,11 @@ CORE_NUMERIC_FIELDS = [
     "policy_last_tokens",
     "policy_last_generation_tokens",
     "policy_last_validation_tokens",
+    "policy_last_observed_roi_per_1k",
     "policy_last_terminal_utility_before",
     "policy_last_terminal_utility_after",
     "policy_last_terminal_utility_delta",
+    "policy_last_terminal_utility_per_1k_tokens",
     "policy_last_repair_success_margin",
     "checkpoint_terminal_utility",
     "checkpoint_lcb_utility",
@@ -243,6 +283,8 @@ CORE_NUMERIC_FIELDS = [
     "repair_outcome_terminal_utility_before_last",
     "repair_outcome_terminal_utility_after_last",
     "repair_outcome_terminal_utility_delta_last",
+    "repair_outcome_observed_roi_per_1k_last",
+    "repair_outcome_terminal_utility_per_1k_tokens_last",
     "repair_outcome_repair_success_margin_last",
     "over_decomposition_flag",
     "initial_validation_score",
@@ -255,6 +297,7 @@ CORE_NUMERIC_FIELDS = [
     "micro_repair_count",
     "micro_repair_source_count",
     "micro_repair_search_replace_count",
+    "micro_repair_coverage_addition_count",
     "micro_repair_qualify_remove_count",
     "micro_repair_tokens",
     "repair_generation_tokens",
@@ -288,6 +331,18 @@ PAPER_COLUMNS = [
     "controller_mode_realized",
     "controller_mode",
     "controller_escalated",
+    "direct_precheck_allowed",
+    "direct_precheck_skipped",
+    "direct_precheck_escalated",
+    "direct_precheck_accepted",
+    "direct_precheck_score",
+    "direct_precheck_incremental_tokens",
+    "direct_precheck_gate_bucket",
+    "direct_precheck_gate_reason",
+    "direct_precheck_gate_block_reasons",
+    "direct_precheck_gate_probability",
+    "direct_precheck_gate_threshold",
+    "direct_precheck_gate_expected_net_tokens",
     "controller_structural_complexity",
     "controller_uncertainty_need",
     "controller_utility_margin",
@@ -332,6 +387,7 @@ PAPER_COLUMNS = [
     "retry_policy_blocked_by_expected_utility_count_last",
     "retry_policy_blocked_by_posterior_count_last",
     "retry_policy_blocked_by_token_reserve_count_last",
+    "retry_policy_blocked_by_threshold_crossing_count_last",
     "retry_policy_action_last",
     "retry_policy_reason_last",
     "retry_policy_retry_type_last",
@@ -352,6 +408,7 @@ PAPER_COLUMNS = [
     "retrieval_diagnostic_count",
     "retrieval_diagnostic_mean_score",
     "retrieval_diagnostic_max_score",
+    "coverage_enhancement_target_count",
     "retrieval_strong_evidence_count",
     "retrieval_medium_or_better_count",
     "evidence_probe_count",
@@ -369,6 +426,14 @@ PAPER_COLUMNS = [
     "selected_action_ucb_bonus",
     "selected_action_n_empirical",
     "selected_action_roi_per_1k",
+    "selected_action_large_deficit_incremental_exception",
+    "selected_action_threshold_crossing_repair_exception",
+    "selected_action_source_backed_material_repair_exception",
+    "selected_action_coverage_addition_exception",
+    "selected_action_token_reserve_exception",
+    "selected_action_token_reserve_exception_reason",
+    "selected_action_effective_tail_token_reserve",
+    "selected_action_reserve_after_expected_repair",
     "policy_repair_observations",
     "policy_repair_accepted_total",
     "policy_repair_rejected_total",
@@ -380,9 +445,11 @@ PAPER_COLUMNS = [
     "policy_last_tokens",
     "policy_last_generation_tokens",
     "policy_last_validation_tokens",
+    "policy_last_observed_roi_per_1k",
     "policy_last_terminal_utility_before",
     "policy_last_terminal_utility_after",
     "policy_last_terminal_utility_delta",
+    "policy_last_terminal_utility_per_1k_tokens",
     "policy_last_repair_success_margin",
     "checkpoint_terminal_utility",
     "checkpoint_lcb_utility",
@@ -399,6 +466,8 @@ PAPER_COLUMNS = [
     "repair_outcome_terminal_utility_before_last",
     "repair_outcome_terminal_utility_after_last",
     "repair_outcome_terminal_utility_delta_last",
+    "repair_outcome_observed_roi_per_1k_last",
+    "repair_outcome_terminal_utility_per_1k_tokens_last",
     "repair_outcome_repair_success_margin_last",
     "over_decomposition_flag",
     "retry_effectiveness",
@@ -409,6 +478,7 @@ PAPER_COLUMNS = [
     "micro_repair_count",
     "micro_repair_source_count",
     "micro_repair_search_replace_count",
+    "micro_repair_coverage_addition_count",
     "micro_repair_qualify_remove_count",
     "micro_repair_tokens",
     "repair_generation_tokens",
@@ -594,7 +664,11 @@ def _extract_metrics(state: Dict[str, Any], strategy: str, runtime_seconds: floa
     forced_mode_applied = bool(scorecard.get("forced_mode_applied", False)) if isinstance(scorecard, dict) else False
     score_features = scorecard.get("features", {}) if isinstance(scorecard, dict) else {}
     mode_scores = scorecard.get("mode_scores", {}) if isinstance(scorecard, dict) else {}
-    controller_mode_realized = str(state.get("controller_mode", "n/a") or "n/a")
+    controller_mode_realized = str(
+        state.get("controller_mode_realized")
+        or state.get("controller_mode", "n/a")
+        or "n/a"
+    )
     controller_mode_initial = str(
         state.get("controller_mode_initial")
         or (scorecard.get("selected_mode", "") if isinstance(scorecard, dict) else "")
@@ -698,6 +772,17 @@ def _extract_metrics(state: Dict[str, Any], strategy: str, runtime_seconds: floa
         for item in retrieval_diagnostics
         if "evidence_probe_upgraded_to_search_and_replace" in (item.get("reasons", []) or [])
     )
+    coverage_enhancement_target_count = sum(
+        1
+        for claim in (state.get("failing_claims", []) or [])
+        if isinstance(claim, dict) and bool(claim.get("coverage_enhancement", False))
+    )
+    if coverage_enhancement_target_count <= 0:
+        coverage_enhancement_target_count = sum(
+            _safe_int(audit.get("coverage_enhancement_target_count", 0), 0)
+            for audit in (state.get("tool_audit", []) or [])
+            if isinstance(audit, dict) and audit.get("tool") == "retrieval_diagnostics"
+        )
 
     policy_audits = [
         audit for audit in (state.get("tool_audit", []) or [])
@@ -795,6 +880,12 @@ def _extract_metrics(state: Dict[str, Any], strategy: str, runtime_seconds: floa
     repair_outcome_terminal_utility_delta_last = _safe_float(
         last_repair_outcome.get("terminal_utility_delta", 0.0), 0.0
     )
+    repair_outcome_observed_roi_per_1k_last = _safe_float(
+        last_repair_outcome.get("observed_roi_per_1k", 0.0), 0.0
+    )
+    repair_outcome_terminal_utility_per_1k_tokens_last = _safe_float(
+        last_repair_outcome.get("terminal_utility_per_1k_tokens", 0.0), 0.0
+    )
     repair_outcome_repair_success_margin_last = _safe_float(
         last_repair_outcome.get("repair_success_margin", 0.0), 0.0
     )
@@ -846,6 +937,11 @@ def _extract_metrics(state: Dict[str, Any], strategy: str, runtime_seconds: floa
         for audit in micro_repair_audits
         if isinstance(audit.get("repair_action_counts", {}), dict)
     )
+    micro_repair_coverage_addition_count = sum(
+        _safe_int((audit.get("repair_action_counts", {}) or {}).get("coverage_addition", 0), 0)
+        for audit in micro_repair_audits
+        if isinstance(audit.get("repair_action_counts", {}), dict)
+    )
     micro_repair_qualify_remove_count = sum(
         _safe_int((audit.get("repair_action_counts", {}) or {}).get("qualify_or_remove", 0), 0)
         + _safe_int((audit.get("repair_action_counts", {}) or {}).get("remove", 0), 0)
@@ -880,10 +976,39 @@ def _extract_metrics(state: Dict[str, Any], strategy: str, runtime_seconds: floa
         "controller_mode_initial": controller_mode_initial,
         "controller_mode_realized": controller_mode_realized,
         "controller_escalated": 1
-        if controller_mode_initial != controller_mode_realized
-        and controller_mode_initial != "n/a"
-        and controller_mode_realized != "n/a"
+        if bool(state.get("controller_escalated", False))
+        or (
+            controller_mode_initial != controller_mode_realized
+            and controller_mode_initial != "n/a"
+            and controller_mode_realized != "n/a"
+        )
         else 0,
+        "direct_precheck_allowed": 1 if bool(state.get("direct_precheck_allowed", False)) else 0,
+        "direct_precheck_skipped": 1 if bool(state.get("direct_precheck_skipped", False)) else 0,
+        "direct_precheck_escalated": 1 if bool(state.get("direct_precheck_escalated", False)) else 0,
+        "direct_precheck_accepted": 1 if bool(state.get("direct_precheck_accepted", False)) else 0,
+        "direct_precheck_score": _safe_int(state.get("direct_precheck_score", 0), 0),
+        "direct_precheck_incremental_tokens": _safe_int(
+            state.get("direct_precheck_incremental_tokens", 0),
+            0,
+        ),
+        "direct_precheck_gate_bucket": str(state.get("direct_precheck_gate_bucket", "") or ""),
+        "direct_precheck_gate_reason": str(state.get("direct_precheck_gate_reason", "") or ""),
+        "direct_precheck_gate_block_reasons": "|".join(state.get("direct_precheck_gate_block_reasons", []) or [])
+        if isinstance(state.get("direct_precheck_gate_block_reasons", []), list)
+        else str(state.get("direct_precheck_gate_block_reasons", "") or ""),
+        "direct_precheck_gate_probability": _safe_float(
+            state.get("direct_precheck_gate_probability", 0.0),
+            0.0,
+        ),
+        "direct_precheck_gate_threshold": _safe_float(
+            state.get("direct_precheck_gate_threshold", 0.0),
+            0.0,
+        ),
+        "direct_precheck_gate_expected_net_tokens": _safe_float(
+            state.get("direct_precheck_gate_expected_net_tokens", 0.0),
+            0.0,
+        ),
         "runtime_seconds": round(runtime_seconds, 3),
         "reliability_score": reliability_score,
         "claims_total": claims_total,
@@ -967,6 +1092,7 @@ def _extract_metrics(state: Dict[str, Any], strategy: str, runtime_seconds: floa
         "retry_policy_blocked_by_expected_utility_count_last": _block_count("expected_utility"),
         "retry_policy_blocked_by_posterior_count_last": _block_count("posterior"),
         "retry_policy_blocked_by_token_reserve_count_last": _block_count("token_reserve"),
+        "retry_policy_blocked_by_threshold_crossing_count_last": _block_count("threshold_crossing"),
         "retry_block_reason_last": retry_block_reason_last,
         "retry_rejected_candidate_block_reason_last": retry_rejected_candidate_block_reason_last,
         "retry_block_reasons": retry_block_reasons_json,
@@ -991,6 +1117,7 @@ def _extract_metrics(state: Dict[str, Any], strategy: str, runtime_seconds: floa
         "retrieval_diagnostic_count": retrieval_diagnostic_count,
         "retrieval_diagnostic_mean_score": retrieval_diagnostic_mean_score,
         "retrieval_diagnostic_max_score": retrieval_diagnostic_max_score,
+        "coverage_enhancement_target_count": coverage_enhancement_target_count,
         "retrieval_strong_evidence_count": retrieval_strong_evidence_count,
         "retrieval_medium_or_better_count": retrieval_medium_or_better_count,
         "evidence_probe_count": evidence_probe_count,
@@ -1010,6 +1137,37 @@ def _extract_metrics(state: Dict[str, Any], strategy: str, runtime_seconds: floa
         "selected_action_ucb_bonus": _safe_float(selected_action.get("ucb_bonus", 0.0), 0.0),
         "selected_action_n_empirical": _safe_float(selected_action.get("n_empirical", 0.0), 0.0),
         "selected_action_roi_per_1k": _safe_float(selected_action.get("roi_per_1k", 0.0), 0.0),
+        "selected_action_large_deficit_incremental_exception": _safe_int(
+            selected_action.get("large_deficit_incremental_exception", 0),
+            0,
+        ),
+        "selected_action_threshold_crossing_repair_exception": _safe_int(
+            selected_action.get("threshold_crossing_repair_exception", 0),
+            0,
+        ),
+        "selected_action_source_backed_material_repair_exception": _safe_int(
+            selected_action.get("source_backed_material_repair_exception", 0),
+            0,
+        ),
+        "selected_action_coverage_addition_exception": _safe_int(
+            selected_action.get("coverage_addition_exception", 0),
+            0,
+        ),
+        "selected_action_token_reserve_exception": _safe_int(
+            selected_action.get("token_reserve_exception", 0),
+            0,
+        ),
+        "selected_action_token_reserve_exception_reason": str(
+            selected_action.get("token_reserve_exception_reason", "") or ""
+        ),
+        "selected_action_effective_tail_token_reserve": _safe_int(
+            selected_action.get("effective_tail_token_reserve", 0),
+            0,
+        ),
+        "selected_action_reserve_after_expected_repair": _safe_int(
+            selected_action.get("reserve_after_expected_repair", 0),
+            0,
+        ),
         "policy_repair_observations": _safe_int(policy_stats.get("repair_observations", 0), 0),
         "policy_repair_accepted_total": _safe_int(policy_stats.get("repair_accepted_total", 0), 0),
         "policy_repair_rejected_total": _safe_int(policy_stats.get("repair_rejected_total", 0), 0),
@@ -1021,9 +1179,14 @@ def _extract_metrics(state: Dict[str, Any], strategy: str, runtime_seconds: floa
         "policy_last_tokens": _safe_int(policy_stats.get("last_tokens", 0), 0),
         "policy_last_generation_tokens": _safe_int(policy_stats.get("last_generation_tokens", 0), 0),
         "policy_last_validation_tokens": _safe_int(policy_stats.get("last_validation_tokens", 0), 0),
+        "policy_last_observed_roi_per_1k": _safe_float(policy_stats.get("last_observed_roi_per_1k", 0.0), 0.0),
         "policy_last_terminal_utility_before": _safe_float(policy_stats.get("last_terminal_utility_before", 0.0), 0.0),
         "policy_last_terminal_utility_after": _safe_float(policy_stats.get("last_terminal_utility_after", 0.0), 0.0),
         "policy_last_terminal_utility_delta": _safe_float(policy_stats.get("last_terminal_utility_delta", 0.0), 0.0),
+        "policy_last_terminal_utility_per_1k_tokens": _safe_float(
+            policy_stats.get("last_terminal_utility_per_1k_tokens", 0.0),
+            0.0,
+        ),
         "policy_last_repair_success_margin": _safe_float(policy_stats.get("last_repair_success_margin", 0.0), 0.0),
         "checkpoint_terminal_utility": _safe_float(checkpoint_selection.get("terminal_utility", 0.0), 0.0),
         "checkpoint_lcb_utility": _safe_float(checkpoint_selection.get("lcb_utility", 0.0), 0.0),
@@ -1040,6 +1203,8 @@ def _extract_metrics(state: Dict[str, Any], strategy: str, runtime_seconds: floa
         "repair_outcome_terminal_utility_before_last": repair_outcome_terminal_utility_before_last,
         "repair_outcome_terminal_utility_after_last": repair_outcome_terminal_utility_after_last,
         "repair_outcome_terminal_utility_delta_last": repair_outcome_terminal_utility_delta_last,
+        "repair_outcome_observed_roi_per_1k_last": repair_outcome_observed_roi_per_1k_last,
+        "repair_outcome_terminal_utility_per_1k_tokens_last": repair_outcome_terminal_utility_per_1k_tokens_last,
         "repair_outcome_repair_success_margin_last": repair_outcome_repair_success_margin_last,
         "over_decomposition_flag": 1 if bool(state.get("over_decomposition_flag", False)) else 0,
         "initial_validation_score": initial_validation_score,
@@ -1052,6 +1217,7 @@ def _extract_metrics(state: Dict[str, Any], strategy: str, runtime_seconds: floa
         "micro_repair_count": micro_repair_count,
         "micro_repair_source_count": micro_repair_source_count,
         "micro_repair_search_replace_count": micro_repair_search_replace_count,
+        "micro_repair_coverage_addition_count": micro_repair_coverage_addition_count,
         "micro_repair_qualify_remove_count": micro_repair_qualify_remove_count,
         "micro_repair_tokens": micro_repair_tokens,
         "repair_generation_tokens": repair_generation_tokens,
@@ -1621,6 +1787,11 @@ def _policy_stats_summary(policy_stats_by_strategy: Dict[str, Dict[str, Any]]) -
         if not isinstance(stats, dict):
             continue
         buckets = stats.get("repair_buckets", {}) if isinstance(stats.get("repair_buckets", {}), dict) else {}
+        direct_buckets = (
+            stats.get("direct_entry_buckets", {})
+            if isinstance(stats.get("direct_entry_buckets", {}), dict)
+            else {}
+        )
         summary[strategy] = {
             "repair_observations": int(stats.get("repair_observations", 0) or 0),
             "repair_accepted_total": int(stats.get("repair_accepted_total", 0) or 0),
@@ -1646,6 +1817,26 @@ def _policy_stats_summary(policy_stats_by_strategy: Dict[str, Dict[str, Any]]) -
                 for bucket, bucket_stats in buckets.items()
                 if isinstance(bucket_stats, dict)
             },
+            "direct_precheck_attempts": int(stats.get("direct_precheck_attempts", 0) or 0),
+            "direct_precheck_accepted_total": int(stats.get("direct_precheck_accepted_total", 0) or 0),
+            "direct_precheck_rejected_total": int(stats.get("direct_precheck_rejected_total", 0) or 0),
+            "direct_precheck_skipped_total": int(stats.get("direct_precheck_skipped_total", 0) or 0),
+            "direct_precheck_accept_rate": float(stats.get("direct_precheck_accept_rate", 0.0) or 0.0),
+            "direct_entry_bucket_count": len(direct_buckets),
+            "direct_entry_buckets": {
+                str(bucket): {
+                    "observations": int(bucket_stats.get("observations", 0) or 0),
+                    "accepted": int(bucket_stats.get("accepted", 0) or 0),
+                    "rejected": int(bucket_stats.get("rejected", 0) or 0),
+                    "skipped": int(bucket_stats.get("skipped", 0) or 0),
+                    "accept_rate": float(bucket_stats.get("accept_rate", 0.0) or 0.0),
+                    "mean_direct_tokens": float(bucket_stats.get("mean_direct_tokens", 0.0) or 0.0),
+                    "mean_shallow_tokens": float(bucket_stats.get("mean_shallow_tokens", 0.0) or 0.0),
+                    "mean_score": float(bucket_stats.get("mean_score", 0.0) or 0.0),
+                }
+                for bucket, bucket_stats in direct_buckets.items()
+                if isinstance(bucket_stats, dict)
+            },
         }
     return summary
 
@@ -1658,6 +1849,189 @@ def _policy_ucb_bonus(*, total_attempts: float, n_empirical: float, exploration:
         2.0 * math.log(max(2.0, total_attempts + 1.0)) / max(1.0, n_empirical + 1.0)
     )
     return min(0.20, exploration * raw_bonus)
+
+
+def _direct_entry_bucket(features: Dict[str, Any]) -> str:
+    structural = _safe_float(features.get("structural_complexity", 0.0), 0.0)
+    uncertainty = _safe_float(features.get("uncertainty_need", 0.0), 0.0)
+    evidence_count = _safe_int(features.get("evidence_count", 0), 0)
+    marker_count = _safe_int(features.get("marker_count", 0), 0)
+    workflow_count = _safe_int(features.get("workflow_count", 0), 0)
+
+    if structural >= 50.0 or uncertainty >= 50.0 or evidence_count >= 3 or marker_count >= 4:
+        return "high_complexity"
+    if structural >= 23.0 or evidence_count >= 1 or marker_count >= 1 or workflow_count >= 2:
+        return "moderate"
+    if workflow_count >= 1:
+        return "simple_workflow"
+    return "simple_plain"
+
+
+def _direct_entry_gate_decision(
+    *,
+    idea: str,
+    policy_stats: Dict[str, Any],
+    policy_exploration: float,
+) -> Dict[str, Any]:
+    """Decide whether adaptive should pay for a direct validation precheck."""
+    features = AdaptiveControllerAgent._complexity_features(idea)
+    bucket = _direct_entry_bucket(features)
+    prior = DIRECT_ENTRY_PRIORS.get(bucket, DIRECT_ENTRY_DEFAULT_PRIOR)
+    stats = policy_stats if isinstance(policy_stats, dict) else {}
+    buckets = stats.get("direct_entry_buckets", {})
+    observed = buckets.get(bucket, {}) if isinstance(buckets, dict) and isinstance(buckets.get(bucket), dict) else {}
+
+    accepted = _safe_float(observed.get("accepted", 0.0), 0.0)
+    rejected = _safe_float(observed.get("rejected", 0.0), 0.0)
+    observations = max(_safe_float(observed.get("observations", 0.0), 0.0), accepted + rejected)
+    alpha = _safe_float(prior.get("alpha", DIRECT_ENTRY_DEFAULT_PRIOR["alpha"]), DIRECT_ENTRY_DEFAULT_PRIOR["alpha"])
+    beta = _safe_float(prior.get("beta", DIRECT_ENTRY_DEFAULT_PRIOR["beta"]), DIRECT_ENTRY_DEFAULT_PRIOR["beta"])
+    posterior_alpha = alpha + accepted
+    posterior_beta = beta + rejected
+    posterior_mean = posterior_alpha / max(1e-6, posterior_alpha + posterior_beta)
+    total_attempts = _safe_float(stats.get("direct_precheck_attempts", 0.0), 0.0)
+    ucb_bonus = _policy_ucb_bonus(
+        total_attempts=total_attempts,
+        n_empirical=observations,
+        exploration=max(0.0, float(policy_exploration)),
+    )
+    posterior_acceptance = min(1.0, posterior_mean + ucb_bonus)
+
+    obs_direct_tokens = _safe_float(
+        observed.get("mean_direct_tokens", prior.get("direct_tokens", 0.0)),
+        _safe_float(prior.get("direct_tokens", 0.0), 0.0),
+    )
+    obs_shallow_tokens = _safe_float(
+        observed.get("mean_shallow_tokens", prior.get("shallow_tokens", 0.0)),
+        _safe_float(prior.get("shallow_tokens", 0.0), 0.0),
+    )
+    token_kappa = 3.0
+    expected_direct_tokens = (
+        token_kappa * _safe_float(prior.get("direct_tokens", 0.0), 0.0)
+        + observations * obs_direct_tokens
+    ) / max(1e-6, token_kappa + observations)
+    expected_shallow_tokens = (
+        token_kappa * _safe_float(prior.get("shallow_tokens", 0.0), 0.0)
+        + observations * obs_shallow_tokens
+    ) / max(1e-6, token_kappa + observations)
+
+    acceptance_threshold = min(
+        0.85,
+        max(
+            DIRECT_ENTRY_MIN_ACCEPTANCE,
+            (expected_direct_tokens + DIRECT_ENTRY_MIN_NET_TOKENS) / max(1.0, expected_shallow_tokens),
+        ),
+    )
+    expected_net_tokens = posterior_acceptance * expected_shallow_tokens - expected_direct_tokens
+
+    block_reasons: List[str] = []
+    if posterior_acceptance < acceptance_threshold:
+        block_reasons.append(
+            f"posterior_acceptance {posterior_acceptance:.3f} < threshold {acceptance_threshold:.3f}"
+        )
+    if expected_net_tokens < DIRECT_ENTRY_MIN_NET_TOKENS:
+        block_reasons.append(
+            f"expected_net_tokens {expected_net_tokens:.0f} < {DIRECT_ENTRY_MIN_NET_TOKENS:.0f}"
+        )
+
+    allowed = not block_reasons
+    return {
+        "allowed": allowed,
+        "bucket_key": bucket,
+        "features": features,
+        "prior_alpha": round(alpha, 4),
+        "prior_beta": round(beta, 4),
+        "observations": int(observations),
+        "accepted": int(accepted),
+        "rejected": int(rejected),
+        "posterior_mean": round(posterior_mean, 4),
+        "ucb_bonus": round(ucb_bonus, 4),
+        "posterior_acceptance": round(posterior_acceptance, 4),
+        "acceptance_threshold": round(acceptance_threshold, 4),
+        "expected_direct_tokens": round(expected_direct_tokens, 2),
+        "expected_shallow_tokens": round(expected_shallow_tokens, 2),
+        "expected_net_tokens": round(expected_net_tokens, 2),
+        "min_expected_net_tokens": DIRECT_ENTRY_MIN_NET_TOKENS,
+        "block_reasons": block_reasons,
+        "reason": "direct_precheck_expected_token_savings_positive" if allowed else "direct_precheck_gate_blocked",
+    }
+
+
+def _direct_entry_policy_stats_update(
+    policy_stats: Dict[str, Any],
+    *,
+    gate_decision: Dict[str, Any],
+    attempted: bool,
+    accepted: bool = False,
+    direct_tokens: int = 0,
+    shallow_tokens: int = 0,
+    direct_score: int = 0,
+) -> Dict[str, Any]:
+    updated = _clone_jsonable(policy_stats or {})
+    bucket = str(gate_decision.get("bucket_key", "moderate") or "moderate")
+    buckets = updated.setdefault("direct_entry_buckets", {})
+    bucket_stats = buckets.setdefault(bucket, {})
+
+    if not attempted:
+        updated["direct_precheck_skipped_total"] = _safe_int(updated.get("direct_precheck_skipped_total", 0), 0) + 1
+        bucket_stats["skipped"] = _safe_int(bucket_stats.get("skipped", 0), 0) + 1
+        return updated
+
+    observations = _safe_int(bucket_stats.get("observations", 0), 0) + 1
+    old_obs = max(0, observations - 1)
+    direct_tokens = max(0, _safe_int(direct_tokens, 0))
+    shallow_tokens = max(0, _safe_int(shallow_tokens, 0))
+
+    bucket_stats["observations"] = observations
+    bucket_stats["accepted"] = _safe_int(bucket_stats.get("accepted", 0), 0) + (1 if accepted else 0)
+    bucket_stats["rejected"] = _safe_int(bucket_stats.get("rejected", 0), 0) + (0 if accepted else 1)
+    bucket_stats["accept_rate"] = round(
+        _safe_int(bucket_stats.get("accepted", 0), 0) / max(1, observations),
+        4,
+    )
+    bucket_stats["mean_direct_tokens"] = round(
+        (
+            _safe_float(bucket_stats.get("mean_direct_tokens", 0.0), 0.0) * old_obs
+            + direct_tokens
+        )
+        / max(1, observations),
+        4,
+    )
+    if shallow_tokens > 0:
+        bucket_stats["mean_shallow_tokens"] = round(
+            (
+                _safe_float(bucket_stats.get("mean_shallow_tokens", 0.0), 0.0) * old_obs
+                + shallow_tokens
+            )
+            / max(1, observations),
+            4,
+        )
+    bucket_stats["mean_score"] = round(
+        (
+            _safe_float(bucket_stats.get("mean_score", 0.0), 0.0) * old_obs
+            + _safe_float(direct_score, 0.0)
+        )
+        / max(1, observations),
+        4,
+    )
+    bucket_stats["mean_expected_net_tokens"] = round(
+        (
+            _safe_float(bucket_stats.get("mean_expected_net_tokens", 0.0), 0.0) * old_obs
+            + _safe_float(gate_decision.get("expected_net_tokens", 0.0), 0.0)
+        )
+        / max(1, observations),
+        4,
+    )
+
+    updated["direct_precheck_attempts"] = _safe_int(updated.get("direct_precheck_attempts", 0), 0) + 1
+    updated["direct_precheck_accepted_total"] = _safe_int(updated.get("direct_precheck_accepted_total", 0), 0) + (1 if accepted else 0)
+    updated["direct_precheck_rejected_total"] = _safe_int(updated.get("direct_precheck_rejected_total", 0), 0) + (0 if accepted else 1)
+    updated["direct_precheck_accept_rate"] = round(
+        _safe_int(updated.get("direct_precheck_accepted_total", 0), 0)
+        / max(1, _safe_int(updated.get("direct_precheck_attempts", 0), 0)),
+        4,
+    )
+    return updated
 
 
 def _policy_calibration_rows(
@@ -1696,13 +2070,22 @@ def _policy_calibration_rows(
                 exploration=exploration,
             )
             posterior_acceptance_ucb = min(1.0, posterior_mean + ucb_bonus)
-            kappa = 5.0
+            default_weights = BayesianRetryPolicy.DEFAULT_WEIGHTS
+            gain_kappa = max(0.0, _safe_float(default_weights.get("gain_kappa", 2.0), 2.0))
+            token_kappa = max(0.0, _safe_float(default_weights.get("token_kappa", 3.0), 3.0))
+            seconds_kappa = max(0.0, _safe_float(default_weights.get("seconds_kappa", 5.0), 5.0))
             obs_gain = _safe_float(observed.get("mean_gain", prior.get("gain", 0.0)), _safe_float(prior.get("gain", 0.0), 0.0))
             obs_tokens = _safe_float(observed.get("mean_tokens", prior.get("tokens", 0.0)), _safe_float(prior.get("tokens", 0.0), 0.0))
             obs_seconds = _safe_float(observed.get("mean_seconds", prior.get("seconds", 0.0)), _safe_float(prior.get("seconds", 0.0), 0.0))
-            expected_gain = (kappa * _safe_float(prior.get("gain", 0.0), 0.0) + observations * obs_gain) / (kappa + observations)
-            expected_tokens = (kappa * _safe_float(prior.get("tokens", 0.0), 0.0) + observations * obs_tokens) / (kappa + observations)
-            expected_seconds = (kappa * _safe_float(prior.get("seconds", 0.0), 0.0) + observations * obs_seconds) / (kappa + observations)
+            expected_gain = (
+                gain_kappa * _safe_float(prior.get("gain", 0.0), 0.0) + observations * obs_gain
+            ) / max(1e-6, gain_kappa + observations)
+            expected_tokens = (
+                token_kappa * _safe_float(prior.get("tokens", 0.0), 0.0) + observations * obs_tokens
+            ) / max(1e-6, token_kappa + observations)
+            expected_seconds = (
+                seconds_kappa * _safe_float(prior.get("seconds", 0.0), 0.0) + observations * obs_seconds
+            ) / max(1e-6, seconds_kappa + observations)
             rows.append(
                 {
                     "strategy": strategy,
@@ -1727,10 +2110,21 @@ def _policy_calibration_rows(
                     "expected_gain": round(expected_gain, 4),
                     "expected_tokens": round(expected_tokens, 4),
                     "expected_seconds": round(expected_seconds, 4),
+                    "gain_kappa": round(gain_kappa, 4),
+                    "token_kappa": round(token_kappa, 4),
+                    "seconds_kappa": round(seconds_kappa, 4),
                     "mean_observed_gain": round(obs_gain, 4),
                     "mean_observed_tokens": round(obs_tokens, 4),
+                    "mean_observed_roi_per_1k": round(
+                        _safe_float(observed.get("mean_observed_roi_per_1k", 0.0), 0.0),
+                        4,
+                    ),
                     "mean_terminal_utility_delta": round(
                         _safe_float(observed.get("mean_terminal_utility_delta", 0.0), 0.0),
+                        4,
+                    ),
+                    "mean_terminal_utility_per_1k_tokens": round(
+                        _safe_float(observed.get("mean_terminal_utility_per_1k_tokens", 0.0), 0.0),
                         4,
                     ),
                 }
@@ -1760,13 +2154,12 @@ def run_methodology_comparison(
     initial_policy_stats_by_strategy: Optional[Dict[str, Dict[str, Any]]] = None,
     policy_exploration: float = 0.15,
 ) -> Dict[str, Any]:
-    """Run strategy comparison with adaptive as a shared-shallow extension.
+    """Run strategy comparison with adaptive as a paired validated cascade.
 
-    Key methodological rule: adaptive_no_retry, adaptive_no_checkpoint, and
-    adaptive_controller all continue from the exact fixed_shallow validated
-    checkpoint for the same idea/run. This makes adaptive baseline-dominating:
-    it can stop and match shallow, or spend extra computation only when the
-    Bayesian policy estimates positive expected utility.
+    Adaptive strategies use canonical direct and shallow checkpoints to isolate
+    the controller effect. Direct can stop early if it validates; otherwise the
+    adaptive branch continues from the exact fixed-shallow checkpoint, and only
+    differs from it when the recursive repair gate executes.
     """
     strategies = strategies or list(DEFAULT_STRATEGIES)
     normalized = [s.strip().lower() for s in strategies if s and s.strip()]
@@ -1849,6 +2242,270 @@ def run_methodology_comparison(
         )
         return state, runtime
 
+    def run_fixed_direct_once(run_idx: int, shared_refinement: Dict[str, Any]) -> tuple[Dict[str, Any], float]:
+        assert adaptive_runner is not None
+        start = time.perf_counter()
+        state = adaptive_runner.run(
+            idea=idea,
+            thread_id=f"{thread_prefix}-fixed_direct-{run_idx}",
+            max_validation_retries=max_validation_retries,
+            validation_threshold=validation_threshold,
+            max_tool_calls=max_tool_calls,
+            max_token_proxy=max_token_proxy,
+            max_total_tokens=max_total_tokens,
+            max_runtime_seconds=max_runtime_seconds,
+            forced_controller_mode="direct",
+            shared_refined_idea=shared_refinement.get("refined_idea"),
+            shared_refinement_token_usage=shared_refinement.get("token_usage"),
+            shared_refinement_tool_audit=shared_refinement.get("tool_audit"),
+        )
+        runtime = time.perf_counter() - start
+        state = _apply_budget_posthoc(
+            state=state,
+            runtime_seconds=runtime,
+            max_tool_calls=max_tool_calls,
+            max_token_proxy=max_token_proxy,
+            max_total_tokens=max_total_tokens,
+            max_runtime_seconds=max_runtime_seconds,
+        )
+        return state, runtime
+
+    def direct_precheck_passes(state: Dict[str, Any]) -> bool:
+        validation = state.get("validation_report", {}) or {}
+        if not isinstance(validation, dict):
+            return False
+        score = _safe_int(validation.get("reliability_score", 0), 0)
+        validator_audit = _latest_validator_audit(state)
+        minimum_claims = _safe_int(validator_audit.get("minimum_claims_required", 3), 3)
+        claims_total = len(validation.get("claims", []) or [])
+        low_claim_count = bool(
+            validator_audit.get("low_claim_count_flag", claims_total < minimum_claims)
+        )
+        return (
+            score >= validation_threshold
+            and not bool(state.get("needs_revision", False))
+            and not low_claim_count
+            and not bool(state.get("budget_hit", False))
+        )
+
+    def incremental_usage_after_shared(state: Dict[str, Any], shared_refinement: Dict[str, Any]) -> Dict[str, int]:
+        usage = state.get("token_usage", {}) or {}
+        shared_usage = shared_refinement.get("token_usage", {}) or {}
+        return {
+            "prompt_tokens": max(
+                0,
+                _safe_int(usage.get("prompt_tokens", 0), 0)
+                - _safe_int(shared_usage.get("prompt_tokens", 0), 0),
+            ),
+            "completion_tokens": max(
+                0,
+                _safe_int(usage.get("completion_tokens", 0), 0)
+                - _safe_int(shared_usage.get("completion_tokens", 0), 0),
+            ),
+            "total_tokens": max(
+                0,
+                _safe_int(usage.get("total_tokens", 0), 0)
+                - _safe_int(shared_usage.get("total_tokens", 0), 0),
+            ),
+        }
+
+    def merge_usage(left: Dict[str, Any], right: Dict[str, int]) -> Dict[str, int]:
+        return {
+            "prompt_tokens": _safe_int(left.get("prompt_tokens", 0), 0) + _safe_int(right.get("prompt_tokens", 0), 0),
+            "completion_tokens": _safe_int(left.get("completion_tokens", 0), 0) + _safe_int(right.get("completion_tokens", 0), 0),
+            "total_tokens": _safe_int(left.get("total_tokens", 0), 0) + _safe_int(right.get("total_tokens", 0), 0),
+        }
+
+    def direct_extra_audits(state: Dict[str, Any], shared_refinement: Dict[str, Any]) -> List[Dict[str, Any]]:
+        audits = list(state.get("tool_audit", []) or [])
+        shared_count = len(shared_refinement.get("tool_audit", []) or [])
+        return _clone_jsonable(audits[shared_count:]) if len(audits) >= shared_count else _clone_jsonable(audits)
+
+    def annotate_direct_acceptance(
+        state: Dict[str, Any],
+        *,
+        policy_stats: Dict[str, Any],
+        adaptive_retry_enabled: bool,
+        adaptive_checkpoint_enabled: bool,
+        shared_refinement: Dict[str, Any],
+        gate_decision: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        accepted = _clone_jsonable(state)
+        validation = accepted.get("validation_report", {}) or {}
+        score = _safe_int(validation.get("reliability_score", 0), 0) if isinstance(validation, dict) else 0
+        incremental_usage = incremental_usage_after_shared(accepted, shared_refinement)
+        accepted.update(
+            {
+                "controller_policy": "adaptive",
+                "forced_controller_mode": None,
+                "controller_mode": "direct",
+                "controller_mode_initial": "direct",
+                "controller_mode_realized": "direct",
+                "controller_escalated": False,
+                "controller_escalation_reason": None,
+                "direct_precheck_allowed": True,
+                "direct_precheck_skipped": False,
+                "direct_precheck_accepted": True,
+                "direct_precheck_escalated": False,
+                "direct_precheck_score": score,
+                "direct_precheck_incremental_tokens": incremental_usage["total_tokens"],
+                "direct_precheck_gate_bucket": gate_decision.get("bucket_key"),
+                "direct_precheck_gate_reason": gate_decision.get("reason"),
+                "direct_precheck_gate_block_reasons": gate_decision.get("block_reasons", []),
+                "direct_precheck_gate_probability": gate_decision.get("posterior_acceptance", 0.0),
+                "direct_precheck_gate_threshold": gate_decision.get("acceptance_threshold", 0.0),
+                "direct_precheck_gate_expected_net_tokens": gate_decision.get("expected_net_tokens", 0.0),
+                "adaptive_retry_enabled": adaptive_retry_enabled,
+                "adaptive_checkpoint_enabled": adaptive_checkpoint_enabled,
+                "policy_stats": dict(policy_stats or accepted.get("policy_stats", {}) or {}),
+                "adaptive_cascade_source": "validated_direct_precheck_accepted",
+            }
+        )
+        audit = list(accepted.get("tool_audit", []) or [])
+        audit.append(
+            {
+                "agent": "adaptive_controller",
+                "tool": "validated_direct_precheck",
+                "status": "accepted",
+                "score": score,
+                "threshold": validation_threshold,
+                "incremental_tokens": incremental_usage["total_tokens"],
+                "gate_bucket": gate_decision.get("bucket_key"),
+                "gate_probability": gate_decision.get("posterior_acceptance", 0.0),
+                "gate_threshold": gate_decision.get("acceptance_threshold", 0.0),
+                "gate_expected_net_tokens": gate_decision.get("expected_net_tokens", 0.0),
+            }
+        )
+        accepted["tool_audit"] = audit
+        return accepted
+
+    def annotate_direct_skip_to_shallow(
+        state: Dict[str, Any],
+        *,
+        gate_decision: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        skipped = _clone_jsonable(state)
+        realized = (
+            "recursive"
+            if _safe_int(skipped.get("repair_rounds", 0), 0) > 0
+            or _safe_int(skipped.get("retry_count", 0), 0) > 0
+            else "shallow"
+        )
+        audit = list(skipped.get("tool_audit", []) or [])
+        audit.append(
+            {
+                "agent": "adaptive_controller",
+                "tool": "direct_entry_gate",
+                "status": "skipped",
+                "gate_bucket": gate_decision.get("bucket_key"),
+                "gate_probability": gate_decision.get("posterior_acceptance", 0.0),
+                "gate_threshold": gate_decision.get("acceptance_threshold", 0.0),
+                "gate_expected_net_tokens": gate_decision.get("expected_net_tokens", 0.0),
+                "reason": gate_decision.get("reason"),
+                "block_reasons": gate_decision.get("block_reasons", []),
+            }
+        )
+        skipped.update(
+            {
+                "tool_audit": audit,
+                "controller_policy": "adaptive",
+                "forced_controller_mode": None,
+                "controller_mode_initial": "shallow",
+                "controller_mode_realized": realized,
+                "controller_mode": realized,
+                "controller_escalated": realized != "shallow",
+                "controller_escalation_reason": (
+                    "direct_entry_gate_skipped_to_recursive_repair"
+                    if realized == "recursive"
+                    else "direct_entry_gate_skipped_to_shallow"
+                ),
+                "direct_precheck_allowed": False,
+                "direct_precheck_skipped": True,
+                "direct_precheck_accepted": False,
+                "direct_precheck_escalated": False,
+                "direct_precheck_score": 0,
+                "direct_precheck_incremental_tokens": 0,
+                "direct_precheck_gate_bucket": gate_decision.get("bucket_key"),
+                "direct_precheck_gate_reason": gate_decision.get("reason"),
+                "direct_precheck_gate_block_reasons": gate_decision.get("block_reasons", []),
+                "direct_precheck_gate_probability": gate_decision.get("posterior_acceptance", 0.0),
+                "direct_precheck_gate_threshold": gate_decision.get("acceptance_threshold", 0.0),
+                "direct_precheck_gate_expected_net_tokens": gate_decision.get("expected_net_tokens", 0.0),
+                "adaptive_cascade_source": "direct_entry_gate_skipped_to_shallow_checkpoint",
+            }
+        )
+        return skipped
+
+    def add_direct_precheck_overhead(
+        state: Dict[str, Any],
+        *,
+        direct_state: Dict[str, Any],
+        shared_refinement: Dict[str, Any],
+        gate_decision: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        merged = _clone_jsonable(state)
+        direct_validation = direct_state.get("validation_report", {}) or {}
+        direct_score = (
+            _safe_int(direct_validation.get("reliability_score", 0), 0)
+            if isinstance(direct_validation, dict)
+            else 0
+        )
+        incremental_usage = incremental_usage_after_shared(direct_state, shared_refinement)
+        merged["token_usage"] = merge_usage(merged.get("token_usage", {}) or {}, incremental_usage)
+        audit = list(merged.get("tool_audit", []) or [])
+        audit.extend(direct_extra_audits(direct_state, shared_refinement))
+        audit.append(
+            {
+                "agent": "adaptive_controller",
+                "tool": "validated_direct_precheck",
+                "status": "escalated",
+                "score": direct_score,
+                "threshold": validation_threshold,
+                "incremental_tokens": incremental_usage["total_tokens"],
+                "reason": "direct_validation_failed_or_low_claim_coverage",
+                "gate_bucket": gate_decision.get("bucket_key"),
+                "gate_probability": gate_decision.get("posterior_acceptance", 0.0),
+                "gate_threshold": gate_decision.get("acceptance_threshold", 0.0),
+                "gate_expected_net_tokens": gate_decision.get("expected_net_tokens", 0.0),
+            }
+        )
+        merged.update(
+            {
+                "tool_audit": audit,
+                "controller_policy": "adaptive",
+                "forced_controller_mode": None,
+                "controller_mode_initial": "direct",
+                "controller_mode_realized": (
+                    "recursive"
+                    if _safe_int(merged.get("repair_rounds", 0), 0) > 0
+                    or _safe_int(merged.get("retry_count", 0), 0) > 0
+                    else "shallow"
+                ),
+                "controller_mode": (
+                    "recursive"
+                    if _safe_int(merged.get("repair_rounds", 0), 0) > 0
+                    or _safe_int(merged.get("retry_count", 0), 0) > 0
+                    else "shallow"
+                ),
+                "controller_escalated": True,
+                "controller_escalation_reason": "direct_precheck_failed_escalated_to_shallow",
+                "direct_precheck_allowed": True,
+                "direct_precheck_skipped": False,
+                "direct_precheck_accepted": False,
+                "direct_precheck_escalated": True,
+                "direct_precheck_score": direct_score,
+                "direct_precheck_incremental_tokens": incremental_usage["total_tokens"],
+                "direct_precheck_gate_bucket": gate_decision.get("bucket_key"),
+                "direct_precheck_gate_reason": gate_decision.get("reason"),
+                "direct_precheck_gate_block_reasons": gate_decision.get("block_reasons", []),
+                "direct_precheck_gate_probability": gate_decision.get("posterior_acceptance", 0.0),
+                "direct_precheck_gate_threshold": gate_decision.get("acceptance_threshold", 0.0),
+                "direct_precheck_gate_expected_net_tokens": gate_decision.get("expected_net_tokens", 0.0),
+                "adaptive_cascade_source": "validated_direct_precheck_then_shallow_checkpoint",
+            }
+        )
+        return merged
+
     for run_idx in range(compare_runs):
         shared_refinement = (
             _shared_refinement_for_run(
@@ -1863,10 +2520,14 @@ def run_methodology_comparison(
         )
         paired_fixed_shallow_state: Dict[str, Any] | None = None
         paired_fixed_shallow_runtime = 0.0
+        paired_fixed_direct_state: Dict[str, Any] | None = None
+        paired_fixed_direct_runtime = 0.0
 
-        # If any adaptive extension is requested, materialize the canonical
-        # shallow checkpoint once even if fixed_shallow is not part of the output.
-        needs_shared_shallow = any(s in ADAPTIVE_STRATEGIES for s in normalized)
+        # Materialize canonical baselines lazily. Adaptive strategies use these
+        # paired checkpoints instead of rerunning shallow independently: direct
+        # can be accepted as a validated low-cost exit, otherwise the adaptive
+        # branch continues from the exact fixed-shallow checkpoint.
+        needs_shared_shallow = "fixed_shallow" in normalized
         if needs_shared_shallow:
             paired_fixed_shallow_state, paired_fixed_shallow_runtime = run_fixed_shallow_once(run_idx, shared_refinement)
 
@@ -1905,9 +2566,13 @@ def run_methodology_comparison(
                     paired_fixed_shallow_state, paired_fixed_shallow_runtime = run_fixed_shallow_once(run_idx, shared_refinement)
                 state = dict(paired_fixed_shallow_state)
                 runtime = paired_fixed_shallow_runtime
-            elif strategy in {"fixed_direct", "fixed_recursive"}:
+            elif strategy == "fixed_direct":
+                if paired_fixed_direct_state is None:
+                    paired_fixed_direct_state, paired_fixed_direct_runtime = run_fixed_direct_once(run_idx, shared_refinement)
+                state = dict(paired_fixed_direct_state)
+                runtime = paired_fixed_direct_runtime
+            elif strategy == "fixed_recursive":
                 assert adaptive_runner is not None
-                forced = strategy.replace("fixed_", "")
                 state = adaptive_runner.run(
                     idea=idea,
                     thread_id=f"{thread_prefix}-{strategy}-{run_idx}",
@@ -1917,7 +2582,7 @@ def run_methodology_comparison(
                     max_token_proxy=max_token_proxy,
                     max_total_tokens=max_total_tokens,
                     max_runtime_seconds=max_runtime_seconds,
-                    forced_controller_mode=forced,
+                    forced_controller_mode="recursive",
                     shared_refined_idea=shared_refinement.get("refined_idea"),
                     shared_refinement_token_usage=shared_refinement.get("token_usage"),
                     shared_refinement_tool_audit=shared_refinement.get("tool_audit"),
@@ -1925,19 +2590,106 @@ def run_methodology_comparison(
                 runtime = time.perf_counter() - start
             else:
                 assert adaptive_runner is not None
-                if paired_fixed_shallow_state is None:
-                    paired_fixed_shallow_state, paired_fixed_shallow_runtime = run_fixed_shallow_once(run_idx, shared_refinement)
                 adaptive_retry_enabled = strategy != "adaptive_no_retry"
                 adaptive_checkpoint_enabled = strategy != "adaptive_no_checkpoint"
-                state = adaptive_runner.continue_from_shallow_checkpoint(
-                    paired_fixed_shallow_state,
-                    adaptive_retry_enabled=adaptive_retry_enabled,
-                    adaptive_checkpoint_enabled=adaptive_checkpoint_enabled,
-                    policy_mode="bayes",
-                    policy_stats=policy_stats_by_strategy.get(strategy, {}),
+                policy_stats = policy_stats_by_strategy.get(strategy, {})
+                gate_decision = _direct_entry_gate_decision(
+                    idea=idea,
+                    policy_stats=policy_stats,
+                    policy_exploration=policy_exploration,
                 )
-                continuation_runtime = time.perf_counter() - start
-                runtime = paired_fixed_shallow_runtime + continuation_runtime
+                if not bool(gate_decision.get("allowed", False)):
+                    if paired_fixed_shallow_state is None:
+                        paired_fixed_shallow_state, paired_fixed_shallow_runtime = run_fixed_shallow_once(run_idx, shared_refinement)
+                    policy_stats = _direct_entry_policy_stats_update(
+                        policy_stats,
+                        gate_decision=gate_decision,
+                        attempted=False,
+                    )
+                    continuation_start = time.perf_counter()
+                    state = adaptive_runner.continue_from_shallow_checkpoint(
+                        paired_fixed_shallow_state,
+                        adaptive_retry_enabled=adaptive_retry_enabled,
+                        adaptive_checkpoint_enabled=adaptive_checkpoint_enabled,
+                        policy_stats=policy_stats,
+                    )
+                    continuation_runtime = time.perf_counter() - continuation_start
+                    state = annotate_direct_skip_to_shallow(
+                        state,
+                        gate_decision=gate_decision,
+                    )
+                    runtime = paired_fixed_shallow_runtime + continuation_runtime
+                else:
+                    if paired_fixed_direct_state is None:
+                        paired_fixed_direct_state, paired_fixed_direct_runtime = run_fixed_direct_once(run_idx, shared_refinement)
+                    direct_validation = paired_fixed_direct_state.get("validation_report", {}) or {}
+                    direct_score = (
+                        _safe_int(direct_validation.get("reliability_score", 0), 0)
+                        if isinstance(direct_validation, dict)
+                        else 0
+                    )
+                    direct_usage = incremental_usage_after_shared(paired_fixed_direct_state, shared_refinement)
+                    shallow_tokens = 0
+                    if paired_fixed_shallow_state is not None:
+                        shallow_tokens = incremental_usage_after_shared(paired_fixed_shallow_state, shared_refinement)["total_tokens"]
+                    direct_accepted = direct_precheck_passes(paired_fixed_direct_state)
+                    policy_stats = _direct_entry_policy_stats_update(
+                        policy_stats,
+                        gate_decision=gate_decision,
+                        attempted=True,
+                        accepted=direct_accepted,
+                        direct_tokens=direct_usage["total_tokens"],
+                        shallow_tokens=shallow_tokens,
+                        direct_score=direct_score,
+                    )
+                    if direct_accepted:
+                        state = annotate_direct_acceptance(
+                            paired_fixed_direct_state,
+                            policy_stats=policy_stats,
+                            adaptive_retry_enabled=adaptive_retry_enabled,
+                            adaptive_checkpoint_enabled=adaptive_checkpoint_enabled,
+                            shared_refinement=shared_refinement,
+                            gate_decision=gate_decision,
+                        )
+                        runtime = paired_fixed_direct_runtime
+                    else:
+                        if paired_fixed_shallow_state is None:
+                            paired_fixed_shallow_state, paired_fixed_shallow_runtime = run_fixed_shallow_once(run_idx, shared_refinement)
+                            shallow_tokens = incremental_usage_after_shared(
+                                paired_fixed_shallow_state,
+                                shared_refinement,
+                            )["total_tokens"]
+                            direct_entry_bucket = (
+                                policy_stats.get("direct_entry_buckets", {})
+                                if isinstance(policy_stats.get("direct_entry_buckets", {}), dict)
+                                else {}
+                            ).get(str(gate_decision.get("bucket_key", "")), {})
+                            if isinstance(direct_entry_bucket, dict) and shallow_tokens > 0:
+                                observations = max(1, _safe_int(direct_entry_bucket.get("observations", 1), 1))
+                                old_obs = max(0, observations - 1)
+                                direct_entry_bucket["mean_shallow_tokens"] = round(
+                                    (
+                                        _safe_float(direct_entry_bucket.get("mean_shallow_tokens", 0.0), 0.0) * old_obs
+                                        + shallow_tokens
+                                    )
+                                    / max(1, observations),
+                                    4,
+                                )
+                        continuation_start = time.perf_counter()
+                        state = adaptive_runner.continue_from_shallow_checkpoint(
+                            paired_fixed_shallow_state,
+                            adaptive_retry_enabled=adaptive_retry_enabled,
+                            adaptive_checkpoint_enabled=adaptive_checkpoint_enabled,
+                            policy_stats=policy_stats,
+                        )
+                        continuation_runtime = time.perf_counter() - continuation_start
+                        state = add_direct_precheck_overhead(
+                            state,
+                            direct_state=paired_fixed_direct_state,
+                            shared_refinement=shared_refinement,
+                            gate_decision=gate_decision,
+                        )
+                        runtime = paired_fixed_direct_runtime + paired_fixed_shallow_runtime + continuation_runtime
                 policy_stats_by_strategy[strategy] = dict(state.get("policy_stats", {}) or {})
 
             state = _apply_budget_posthoc(
@@ -1990,7 +2742,7 @@ def run_methodology_comparison(
             "max_token_proxy": max_token_proxy,
             "max_total_tokens": max_total_tokens,
             "max_runtime_seconds": max_runtime_seconds,
-            "adaptive_extension_source": "fixed_shallow_shared_checkpoint",
+            "adaptive_extension_source": "paired_validated_direct_shallow_recursive_cascade",
             "adaptive_policy": "bayes",
             "policy_exploration": utility_weights["ucb_exploration"],
             "policy_ucb_enabled": utility_weights["ucb_exploration"] > 0.0,
@@ -2208,6 +2960,7 @@ def save_paper_mode_exports(
         "micro_repair_count_mean",
         "micro_repair_source_count_mean",
         "micro_repair_search_replace_count_mean",
+        "micro_repair_coverage_addition_count_mean",
         "micro_repair_qualify_remove_count_mean",
         "micro_repair_tokens_mean",
         "repair_gain_per_1k_tokens_mean",
@@ -2410,6 +3163,7 @@ def run_methodology_batch_comparison(
             "max_token_proxy": max_token_proxy,
             "max_total_tokens": max_total_tokens,
             "max_runtime_seconds": max_runtime_seconds,
+            "adaptive_extension_source": "paired_validated_direct_shallow_recursive_cascade",
             "adaptive_policy": "bayes",
             "policy_exploration": max(0.0, float(policy_exploration)),
             "policy_ucb_enabled": max(0.0, float(policy_exploration)) > 0.0,

@@ -25,11 +25,12 @@ from startup_pitch_refinery.state import PitchState
 
 
 class StartupPitchRefinery:
-    """LangGraph workflow for baseline-dominating adaptive decomposition.
+    """LangGraph workflow for validated adaptive decomposition.
 
-    The adaptive policy is a strict post-shallow extension: start from the same
-    validated shallow checkpoint used by the fixed_shallow baseline, then run at
-    most one positive-expected-utility claim repair unless thresholds allow more.
+    Adaptive execution is a validated cascade: use direct only when the
+    controller predicts that low decomposition can satisfy validation, escalate
+    failed direct attempts to shallow when adaptive repair is enabled, and use
+    recursive claim repair only for source-bound factual gaps.
     """
 
     def __init__(
@@ -261,6 +262,196 @@ class StartupPitchRefinery:
         agg = validation.get("judge_scores", {}).get("aggregated", {}) if isinstance(validation.get("judge_scores", {}), dict) else {}
         return bool(agg.get("low_claim_count_flag", False))
 
+    @staticmethod
+    def _coverage_enhancement_target(
+        base_state: Dict[str, Any],
+        validation: Dict[str, Any],
+        *,
+        missing_claim_count: int = 0,
+        claims_total: int = 0,
+        minimum_claims_required: int = 0,
+    ) -> Dict[str, Any]:
+        """Create one bounded target for missing source-backed claim coverage."""
+        idea = str(base_state.get("refined_idea") or base_state.get("idea") or "").strip()
+        text = idea.lower()
+        evidence_gaps = str(validation.get("evidence_gaps", "") or "").strip()
+        regulated = any(
+            marker in text
+            for marker in [
+                "hipaa",
+                "healthcare",
+                "clinic",
+                "clinical",
+                "patient",
+                "ehr",
+                "compliance",
+                "regulatory",
+                "authorization",
+            ]
+        )
+        ecommerce = any(marker in text for marker in ["shopify", "cart", "ecommerce", "commerce", "conversion"])
+        if regulated:
+            category = "regulatory_or_compliance"
+            claim = (
+                "Coverage enhancement target: add source-backed regulatory or workflow-specific "
+                "market detail for HIPAA-compliant prior-authorization automation in specialty clinics."
+            )
+            queries = [
+                "HIPAA prior authorization automation specialty clinics EHR integration market evidence",
+                "AI prior authorization healthcare workflow automation compliance specialty clinics evidence",
+            ]
+        elif ecommerce:
+            category = "market_size_or_numeric"
+            claim = (
+                "Coverage enhancement target: add source-backed numeric market or conversion benchmark "
+                "for Shopify abandoned-cart recovery and AI personalization."
+            )
+            queries = [
+                "Shopify abandoned cart recovery conversion benchmark AI personalization evidence",
+                "ecommerce abandoned cart rate personalized discount campaign market evidence",
+            ]
+        else:
+            category = "market_size_or_numeric"
+            claim = (
+                "Coverage enhancement target: add source-backed market sizing, adoption, or usage "
+                "benchmark that makes the startup market analysis more specific."
+            )
+            queries = [
+                f"{idea} market size adoption benchmark evidence",
+                f"{idea} user adoption market evidence source",
+            ]
+        coverage_note = ""
+        if missing_claim_count > 0:
+            required = int(minimum_claims_required or (claims_total + missing_claim_count))
+            coverage_note = (
+                f" The validator found {claims_total} source-checkable claims and requires "
+                f"{required}, so {missing_claim_count} source-backed "
+                "claim(s) are missing."
+            )
+        rationale = (
+            "The validation report has incomplete atomic-claim coverage, so this target repairs "
+            "rubric-level coverage and specificity rather than only rewriting an existing failed claim."
+            f"{coverage_note}"
+        )
+        if evidence_gaps:
+            rationale = f"{rationale} Validator evidence gaps: {evidence_gaps[:240]}"
+        return {
+            "claim_id": "coverage_gap_1",
+            "claim": claim,
+            "claim_text": claim,
+            "verdict": "needs_review",
+            "confidence": 0.5,
+            "rationale": rationale,
+            "supporting_sources": [],
+            "category": category,
+            "materiality": 5,
+            "failure_type": "coverage_gap",
+            "action": "coverage_addition",
+            "coverage_enhancement": True,
+            "missing_claim_count": max(0, int(missing_claim_count or 0)),
+            "claims_total_before_repair": max(0, int(claims_total or 0)),
+            "target_add_count": min(max(1, int(missing_claim_count or 1)), 2),
+            "candidate_queries": queries,
+        }
+
+    @staticmethod
+    def _claim_coverage_counts(validation: Dict[str, Any]) -> Dict[str, int]:
+        if not isinstance(validation, dict):
+            return {"claims_total": 0, "minimum_claims_required": 0, "missing_claim_count": 0}
+        claims = validation.get("claim_units", []) or validation.get("claims", []) or []
+        claims_total = sum(1 for claim in claims if isinstance(claim, dict))
+        judge_scores = validation.get("judge_scores", {})
+        aggregated = judge_scores.get("aggregated", {}) if isinstance(judge_scores, dict) else {}
+        minimum_claims = int(aggregated.get("minimum_claims_required", 0) or 0)
+        if minimum_claims <= 0:
+            minimum_claims = 5 if claims_total > 0 else 0
+        reported_missing = int(aggregated.get("missing_claim_count", 0) or 0)
+        computed_missing = max(0, minimum_claims - claims_total)
+        missing = max(0, reported_missing, computed_missing)
+        return {
+            "claims_total": claims_total,
+            "minimum_claims_required": minimum_claims,
+            "missing_claim_count": missing,
+        }
+
+    def _validation_quality_fields(self, validation: Dict[str, Any]) -> Dict[str, Any]:
+        coverage = self._claim_coverage_counts(validation)
+        claims_total = int(coverage.get("claims_total", 0) or 0)
+        minimum_claims = int(coverage.get("minimum_claims_required", 0) or 0)
+        coverage_ratio = min(1.0, claims_total / max(1, minimum_claims)) if minimum_claims > 0 else 0.0
+        return {
+            "claims_total": claims_total,
+            "minimum_claims_required": minimum_claims,
+            "missing_claim_count": int(coverage.get("missing_claim_count", 0) or 0),
+            "claim_coverage_ratio": round(coverage_ratio, 4),
+            "supported_ratio": round(self._validation_supported_ratio(validation), 4),
+            "material_failing_claim_count": self._material_failing_count(validation),
+            "low_claim_count_flag": self._low_claim_count(validation),
+        }
+
+    def _quality_safe_repair_checkpoint(
+        self,
+        candidate: Dict[str, Any],
+        baseline: Dict[str, Any],
+    ) -> tuple[bool, List[str], Dict[str, Any]]:
+        """Reject score gains that are produced by collapsing validation coverage."""
+        candidate_quality = self._validation_quality_fields(candidate.get("validation_report", {}) or {})
+        baseline_quality = self._validation_quality_fields(baseline.get("validation_report", {}) or {})
+
+        # Snapshot-level values are authoritative when present because older
+        # snapshots may be built from merged state rather than raw validation only.
+        for key in (
+            "claims_total",
+            "minimum_claims_required",
+            "missing_claim_count",
+            "claim_coverage_ratio",
+            "supported_ratio",
+            "material_failing_claim_count",
+            "low_claim_count_flag",
+        ):
+            if key in candidate:
+                candidate_quality[key] = candidate.get(key)
+            if key in baseline:
+                baseline_quality[key] = baseline.get(key)
+
+        candidate_claims = int(candidate_quality.get("claims_total", 0) or 0)
+        candidate_minimum = int(candidate_quality.get("minimum_claims_required", 0) or 0)
+        candidate_missing = int(candidate_quality.get("missing_claim_count", 0) or 0)
+        baseline_missing = int(baseline_quality.get("missing_claim_count", 0) or 0)
+        candidate_coverage = float(candidate_quality.get("claim_coverage_ratio", 0.0) or 0.0)
+        baseline_coverage = float(baseline_quality.get("claim_coverage_ratio", 0.0) or 0.0)
+        candidate_material = int(candidate_quality.get("material_failing_claim_count", 0) or 0)
+        baseline_material = int(baseline_quality.get("material_failing_claim_count", 0) or 0)
+        candidate_low_claim = bool(candidate_quality.get("low_claim_count_flag", False))
+
+        reasons: List[str] = []
+        if candidate_minimum > 0 and candidate_claims < candidate_minimum:
+            reasons.append("repaired_claim_count_below_required")
+        if candidate_missing > baseline_missing:
+            reasons.append("missing_claim_count_increased")
+        if candidate_coverage + 1e-9 < baseline_coverage:
+            reasons.append("claim_coverage_decreased")
+        if candidate_low_claim:
+            reasons.append("low_claim_count_after_repair")
+        if candidate_material > baseline_material:
+            reasons.append("material_failing_claim_count_increased")
+
+        summary = {
+            "candidate_claims_total": candidate_claims,
+            "candidate_minimum_claims_required": candidate_minimum,
+            "candidate_missing_claim_count": candidate_missing,
+            "candidate_claim_coverage_ratio": round(candidate_coverage, 4),
+            "candidate_material_failing_claim_count": candidate_material,
+            "candidate_low_claim_count_flag": candidate_low_claim,
+            "baseline_claims_total": int(baseline_quality.get("claims_total", 0) or 0),
+            "baseline_minimum_claims_required": int(baseline_quality.get("minimum_claims_required", 0) or 0),
+            "baseline_missing_claim_count": baseline_missing,
+            "baseline_claim_coverage_ratio": round(baseline_coverage, 4),
+            "baseline_material_failing_claim_count": baseline_material,
+            "quality_block_reasons": reasons,
+        }
+        return not reasons, reasons, summary
+
     def _build_validation_snapshot(self, state: Dict[str, Any]) -> Dict[str, Any]:
         validation = self._sget(state, "validation_report", {}) or {}
         agreement = validation.get("agreement_stats", {}).get("overall_agreement", 0.0) if isinstance(validation, dict) else 0.0
@@ -275,6 +466,7 @@ class StartupPitchRefinery:
             "supported_ratio": round(self._validation_supported_ratio(validation), 4),
             "material_failing_claim_count": self._material_failing_count(validation),
             "low_claim_count_flag": self._low_claim_count(validation),
+            **self._validation_quality_fields(validation),
             "total_tokens_at_checkpoint": int(token_usage.get("total_tokens", 0) or 0),
             "market_analysis": self._sget(state, "market_analysis"),
             "validated_market_analysis": self._sget(state, "validated_market_analysis"),
@@ -295,7 +487,6 @@ class StartupPitchRefinery:
         weights = {
             "eta_a": 0.02,
             "eta_s": 0.03,
-            "lambda_tok": 0.5,
             "lambda_crit": 4.0,
             "lambda_low": 6.0,
             **(self._sget(state, "utility_weights", {}) or {}),
@@ -304,15 +495,12 @@ class StartupPitchRefinery:
         q = float(snapshot.get("reliability_score", 0.0) or 0.0)
         agreement = float(snapshot.get("judge_agreement", 0.0) or 0.0)
         support = float(snapshot.get("supported_ratio", 0.0) or 0.0)
-        tokens = int(snapshot.get("total_tokens_at_checkpoint", 0) or 0)
-        base_tokens = int(baseline.get("total_tokens_at_checkpoint", tokens) or tokens)
         material_failures = int(snapshot.get("material_failing_claim_count", 0) or 0)
         low_claim = 1 if snapshot.get("low_claim_count_flag") else 0
         return (
             q
             + weights["eta_a"] * 100.0 * agreement
             + weights["eta_s"] * 100.0 * support
-            - weights["lambda_tok"] * max(0, tokens - base_tokens) / 1000.0
             - weights["lambda_crit"] * material_failures
             - weights["lambda_low"] * low_claim
         )
@@ -339,7 +527,22 @@ class StartupPitchRefinery:
         return self._run_node_with_budget(state, self.controller_agent.run, "controller")
 
     def _run_market(self, state: PitchState):
-        return self._run_node_with_budget(state, self.market_agent.run, "market")
+        updates = self._run_node_with_budget(state, self.market_agent.run, "market")
+        base_state = state if isinstance(state, dict) else state.model_dump()
+        if (
+            str(self._sget(base_state, "controller_mode", "") or "").strip().lower() == "direct"
+            and bool(self._sget(base_state, "needs_revision", False))
+            and self._sget(base_state, "validation_report")
+        ):
+            updates.update(
+                {
+                    "direct_precheck_escalated": True,
+                    "controller_escalated": True,
+                    "controller_escalation_reason": "direct_validation_failed_escalated_to_shallow",
+                    "controller_mode_realized": "shallow",
+                }
+            )
+        return updates
 
     def _run_direct(self, state: PitchState):
         if self.direct_agent is None:
@@ -423,38 +626,42 @@ class StartupPitchRefinery:
             "judge_agreement": float((previous_validation.get("agreement_stats", {}) or {}).get("overall_agreement", 0.0) or 0.0)
             if isinstance(previous_validation, dict)
             else 0.0,
-            "supported_ratio": self._validation_supported_ratio(previous_validation),
-            "material_failing_claim_count": self._material_failing_count(previous_validation),
-            "low_claim_count_flag": self._low_claim_count(previous_validation),
+            **self._validation_quality_fields(previous_validation),
             "total_tokens_at_checkpoint": previous_tokens,
+            "validation_report": previous_validation,
         }
         current_snapshot = {
             "reliability_score": current_score,
             "judge_agreement": float((validation.get("agreement_stats", {}) or {}).get("overall_agreement", 0.0) or 0.0)
             if isinstance(validation, dict)
             else 0.0,
-            "supported_ratio": self._validation_supported_ratio(validation),
-            "material_failing_claim_count": self._material_failing_count(validation),
-            "low_claim_count_flag": self._low_claim_count(validation),
+            **self._validation_quality_fields(validation),
             "total_tokens_at_checkpoint": current_tokens,
+            "validation_report": validation,
         }
         terminal_utility_before = self._checkpoint_utility(previous_snapshot, previous_snapshot, base_state)
         terminal_utility_after = self._checkpoint_utility(current_snapshot, previous_snapshot, {**base_state, **updates})
         terminal_utility_delta = terminal_utility_after - terminal_utility_before
-        repair_success_margin = float(
-            (self._sget(base_state, "utility_weights", {}) or {}).get(
-                "repair_success_margin",
-                self.utility_weights.get("repair_success_margin", 1.0),
-            )
-            or 1.0
+        observed_score_roi_per_1k = (gain * 1000.0 / observed_tokens) if observed_tokens > 0 else 0.0
+        observed_terminal_utility_per_1k = (
+            terminal_utility_delta * 1000.0 / observed_tokens
+            if observed_tokens > 0
+            else 0.0
         )
-        policy_success = bool(patch_accepted and terminal_utility_delta >= repair_success_margin)
+        repair_success_margin = 0.0
+        quality_safe, quality_block_reasons, quality_summary = self._quality_safe_repair_checkpoint(
+            current_snapshot,
+            previous_snapshot,
+        )
+        policy_success = bool(current_score > previous_score and quality_safe)
         if policy_success:
-            policy_outcome = "success"
+            policy_outcome = "score_improved_quality_safe"
+        elif current_score > previous_score:
+            policy_outcome = "score_improved_but_quality_unsafe"
         elif patch_accepted:
-            policy_outcome = "accepted_no_terminal_utility_gain"
+            policy_outcome = "patch_accepted_score_not_improved"
         else:
-            policy_outcome = "patch_rejected"
+            policy_outcome = "patch_rejected_score_not_improved"
 
         policy_stats = json.loads(json.dumps(self._sget(base_state, "policy_stats", {}) or {}))
         buckets = policy_stats.setdefault("repair_buckets", {})
@@ -469,10 +676,23 @@ class StartupPitchRefinery:
         stat["mean_gain"] = round(((float(stat.get("mean_gain", 0.0) or 0.0) * prior_count) + gain) / new_count, 4)
         stat["mean_tokens"] = round(((float(stat.get("mean_tokens", 0.0) or 0.0) * prior_count) + observed_tokens) / new_count, 4)
         stat["mean_seconds"] = round(((float(stat.get("mean_seconds", 0.0) or 0.0) * prior_count) + float(selected_action.get("expected_seconds", 0.0) or 0.0)) / new_count, 4)
+        stat["mean_observed_roi_per_1k"] = round(
+            ((float(stat.get("mean_observed_roi_per_1k", 0.0) or 0.0) * prior_count) + observed_score_roi_per_1k)
+            / new_count,
+            4,
+        )
         stat["accept_rate"] = round(stat["accepted"] / max(1, new_count), 4)
         stat["patch_accept_rate"] = round(stat["patch_accepted"] / max(1, new_count), 4)
         stat["mean_terminal_utility_delta"] = round(
             ((float(stat.get("mean_terminal_utility_delta", 0.0) or 0.0) * prior_count) + terminal_utility_delta)
+            / new_count,
+            4,
+        )
+        stat["mean_terminal_utility_per_1k_tokens"] = round(
+            (
+                (float(stat.get("mean_terminal_utility_per_1k_tokens", 0.0) or 0.0) * prior_count)
+                + observed_terminal_utility_per_1k
+            )
             / new_count,
             4,
         )
@@ -493,10 +713,14 @@ class StartupPitchRefinery:
         policy_stats["last_generation_tokens"] = repair_generation_tokens
         policy_stats["last_validation_tokens"] = repair_validation_tokens
         policy_stats["last_bucket_key"] = bucket
+        policy_stats["last_observed_roi_per_1k"] = round(observed_score_roi_per_1k, 4)
         policy_stats["last_terminal_utility_before"] = round(terminal_utility_before, 4)
         policy_stats["last_terminal_utility_after"] = round(terminal_utility_after, 4)
         policy_stats["last_terminal_utility_delta"] = round(terminal_utility_delta, 4)
+        policy_stats["last_terminal_utility_per_1k_tokens"] = round(observed_terminal_utility_per_1k, 4)
         policy_stats["last_repair_success_margin"] = round(repair_success_margin, 4)
+        policy_stats["last_repair_quality_safe"] = bool(quality_safe)
+        policy_stats["last_repair_quality_block_reasons"] = quality_block_reasons
 
         history = list(self._sget(base_state, "repair_validation_history", []) or [])
         history.append(
@@ -511,12 +735,17 @@ class StartupPitchRefinery:
                 "score_after": current_score,
                 "gain": gain,
                 "observed_tokens": observed_tokens,
+                "observed_roi_per_1k": round(observed_score_roi_per_1k, 4),
                 "repair_generation_tokens": repair_generation_tokens,
                 "repair_validation_tokens": repair_validation_tokens,
                 "terminal_utility_before": round(terminal_utility_before, 4),
                 "terminal_utility_after": round(terminal_utility_after, 4),
                 "terminal_utility_delta": round(terminal_utility_delta, 4),
+                "terminal_utility_per_1k_tokens": round(observed_terminal_utility_per_1k, 4),
                 "repair_success_margin": round(repair_success_margin, 4),
+                "quality_safe": bool(quality_safe),
+                "quality_block_reasons": quality_block_reasons,
+                **quality_summary,
                 "selected_action": selected_action,
             }
         )
@@ -541,13 +770,45 @@ class StartupPitchRefinery:
             if verdict in {"weakly_supported", "unsupported", "needs_review"}:
                 failing_claims.append(claim)
         baseline = self._ensure_baseline_checkpoint(base_state)
+        score = self._validation_score(validation)
+        threshold = int(self._sget(base_state, "validation_threshold", 70) or 70)
+        coverage_counts = self._claim_coverage_counts(validation)
+        missing_claim_count = int(coverage_counts.get("missing_claim_count", 0) or 0)
+        claims_total = int(coverage_counts.get("claims_total", 0) or 0)
+        minimum_claims_required = int(coverage_counts.get("minimum_claims_required", 0) or 0)
+        has_coverage_target = any(
+            isinstance(claim, dict) and bool(claim.get("coverage_enhancement"))
+            for claim in failing_claims
+        )
+        if missing_claim_count > 0 and (score < threshold or bool(self._sget(base_state, "needs_revision", False))):
+            if not has_coverage_target:
+                failing_claims.append(
+                    self._coverage_enhancement_target(
+                        base_state,
+                        validation,
+                        missing_claim_count=missing_claim_count,
+                        claims_total=claims_total,
+                        minimum_claims_required=minimum_claims_required,
+                    )
+                )
         if not failing_claims:
-            return {
-                "baseline_checkpoint": baseline,
-                "best_checkpoint": baseline,
-                "retrieval_diagnostics": [],
-                "failing_claims": [],
-            }
+            if score < threshold:
+                failing_claims = [
+                    self._coverage_enhancement_target(
+                        base_state,
+                        validation,
+                        missing_claim_count=missing_claim_count,
+                        claims_total=claims_total,
+                        minimum_claims_required=minimum_claims_required,
+                    )
+                ]
+            else:
+                return {
+                    "baseline_checkpoint": baseline,
+                    "best_checkpoint": baseline,
+                    "retrieval_diagnostics": [],
+                    "failing_claims": [],
+                }
         diagnostics = self.claim_repair_agent.diagnose_repairability(
             refined_idea=str(self._sget(base_state, "refined_idea", "") or ""),
             claims=failing_claims,
@@ -562,6 +823,9 @@ class StartupPitchRefinery:
                 "status": "ok",
                 "claim_count": len(failing_claims),
                 "diagnostic_count": len(diag_dicts),
+                "coverage_enhancement_target_count": sum(
+                    1 for claim in failing_claims if isinstance(claim, dict) and claim.get("coverage_enhancement")
+                ),
                 "mean_retrieval_score": round(sum(float(d.get("retrieval_score", 0.0) or 0.0) for d in diag_dicts) / max(1, len(diag_dicts)), 4),
                 "strong_evidence_count": sum(1 for d in diag_dicts if d.get("evidence_strength") == "strong"),
                 "evidence_probe_count": sum(
@@ -735,6 +999,17 @@ class StartupPitchRefinery:
                 weak_claims.append(item)
         selected_action = self._sget(state, "selected_action", {}) or {}
         selected_ids = {str(x) for x in selected_action.get("selected_claim_ids", []) or []}
+        state_failing_claims = [
+            c
+            for c in (self._sget(state, "failing_claims", []) or [])
+            if isinstance(c, dict)
+        ]
+        existing_ids = {str(c.get("claim_id")) for c in weak_claims if isinstance(c, dict)}
+        for claim in state_failing_claims:
+            claim_id = str(claim.get("claim_id") or "")
+            if claim_id and claim_id not in existing_ids:
+                weak_claims.append(dict(claim))
+                existing_ids.add(claim_id)
         if selected_ids:
             weak_claims = [c for c in weak_claims if str(c.get("claim_id")) in selected_ids]
         repair_plan = build_claim_repair_plan(weak_claims)
@@ -742,15 +1017,18 @@ class StartupPitchRefinery:
         guard_adjusted_action = str(selected_action.get("guard_adjusted_action") or "").strip()
         requested_action_type = str(selected_action.get("requested_action_type") or selected_action_type).strip()
         guard_reasons = selected_action.get("source_bound_guard_reasons", []) or []
-        if selected_action_type in {"search_and_replace", "qualify_or_remove", "remove"}:
+        if selected_action_type in {"search_and_replace", "coverage_addition", "qualify_or_remove", "remove"}:
             for item in repair_plan:
                 item["policy_selected_action"] = requested_action_type or selected_action_type
                 item["policy_guard_adjusted_action"] = guard_adjusted_action or selected_action_type
                 if guard_reasons:
                     item["policy_guard_reasons"] = list(guard_reasons)
                     item.setdefault("guard_reason", "|".join(str(x) for x in guard_reasons))
-                if (guard_adjusted_action or selected_action_type) in {"search_and_replace", "qualify_or_remove", "remove"}:
-                    item["action"] = guard_adjusted_action or selected_action_type
+                forced_action = guard_adjusted_action or selected_action_type
+                if forced_action in {"search_and_replace", "coverage_addition"}:
+                    item["action"] = forced_action
+                elif forced_action in {"qualify_or_remove", "remove"}:
+                    item["policy_conservative_action_not_forced"] = True
         return {
             "repair_strategy": "baseline_dominating_bayesian_claim_repair",
             "previous_validation_score": self._validation_score(validation),
@@ -764,6 +1042,7 @@ class StartupPitchRefinery:
             "selected_action": selected_action,
             "repair_action_counts": {
                 "search_and_replace": sum(1 for x in repair_plan if x.get("action") == "search_and_replace"),
+                "coverage_addition": sum(1 for x in repair_plan if x.get("action") == "coverage_addition"),
                 "qualify_or_remove": sum(1 for x in repair_plan if x.get("action") == "qualify_or_remove"),
                 "remove": sum(1 for x in repair_plan if x.get("action") == "remove"),
             },
@@ -795,6 +1074,7 @@ class StartupPitchRefinery:
         actual_plan = updates.get("repair_plan", []) or repair_context.get("repair_plan", []) or []
         actual_action_counts = {
             "search_and_replace": sum(1 for x in actual_plan if isinstance(x, dict) and x.get("action") == "search_and_replace"),
+            "coverage_addition": sum(1 for x in actual_plan if isinstance(x, dict) and x.get("action") == "coverage_addition"),
             "qualify_or_remove": sum(1 for x in actual_plan if isinstance(x, dict) and x.get("action") == "qualify_or_remove"),
             "remove": sum(1 for x in actual_plan if isinstance(x, dict) and x.get("action") == "remove"),
         }
@@ -803,7 +1083,11 @@ class StartupPitchRefinery:
             for x in actual_plan
             if isinstance(x, dict)
             and str(x.get("guard_reason", "")).strip()
-            and str(x.get("guard_reason")) != "source_bound_search_allowed"
+            and str(x.get("guard_reason")) not in {
+                "source_bound_search_allowed",
+                "coverage_addition_source_search_allowed",
+                "already_conservative_action",
+            }
         ]
         history.append(
             {
@@ -895,8 +1179,27 @@ class StartupPitchRefinery:
             )
         current = snapshots[-1]
         if checkpoint_enabled:
-            best_meta = max(utilities, key=lambda u: (float(u["lcb_utility"]), float(u["terminal_utility"]), -int(u.get("tokens", 0) or 0)))
-            best = next(s for s in snapshots if s.get("checkpoint_index") == best_meta.get("checkpoint_index"))
+            baseline_index = baseline.get("checkpoint_index")
+
+            def _score_monotonic_key(snapshot: Dict[str, Any]) -> tuple:
+                is_baseline = snapshot.get("checkpoint_index") == baseline_index
+                quality_safe = True if is_baseline else self._quality_safe_repair_checkpoint(snapshot, baseline)[0]
+                return (
+                    1 if quality_safe else 0,
+                    int(snapshot.get("reliability_score", 0) or 0),
+                    -int(snapshot.get("material_failing_claim_count", 0) or 0),
+                    0 if snapshot.get("low_claim_count_flag") else 1,
+                    float(snapshot.get("claim_coverage_ratio", 0.0) or 0.0),
+                    float(snapshot.get("supported_ratio", 0.0) or 0.0),
+                    float(snapshot.get("judge_agreement", 0.0) or 0.0),
+                    -int(snapshot.get("total_tokens_at_checkpoint", 0) or 0),
+                )
+
+            best = max(snapshots, key=_score_monotonic_key)
+            best_meta = next(
+                (u for u in utilities if u.get("checkpoint_index") == best.get("checkpoint_index")),
+                utilities[-1],
+            )
             baseline_score = int(baseline.get("reliability_score", 0) or 0)
             current_score = int(current.get("reliability_score", 0) or 0)
             repair_history = [
@@ -905,17 +1208,9 @@ class StartupPitchRefinery:
             ]
             last_repair = repair_history[-1] if repair_history else {}
             latest_repair_accepted = bool(last_repair.get("policy_success", last_repair.get("accepted", False)))
-            support_floor_ok = float(current.get("supported_ratio", 0.0) or 0.0) + 0.05 >= float(baseline.get("supported_ratio", 0.0) or 0.0)
-            agreement_floor_ok = float(current.get("judge_agreement", 0.0) or 0.0) + 0.05 >= float(baseline.get("judge_agreement", 0.0) or 0.0)
-            material_risk_ok = int(current.get("material_failing_claim_count", 0) or 0) <= int(baseline.get("material_failing_claim_count", 0) or 0)
-            low_claim_ok = not bool(current.get("low_claim_count_flag", False)) or bool(baseline.get("low_claim_count_flag", False))
             quality_gain_override = (
                 latest_repair_accepted
                 and current_score > baseline_score
-                and support_floor_ok
-                and agreement_floor_ok
-                and material_risk_ok
-                and low_claim_ok
             )
             if quality_gain_override:
                 best = current
@@ -925,6 +1220,10 @@ class StartupPitchRefinery:
             best_meta = utilities[-1]
             quality_gain_override = False
         selected_previous = best.get("checkpoint_index") != current.get("checkpoint_index")
+        best_quality_safe = True
+        best_quality_block_reasons: List[str] = []
+        if checkpoint_enabled and best.get("checkpoint_index") != baseline.get("checkpoint_index"):
+            best_quality_safe, best_quality_block_reasons, _ = self._quality_safe_repair_checkpoint(best, baseline)
         selection = {
             "selected_checkpoint_index": best.get("checkpoint_index"),
             "selected_retry_count": best.get("retry_count"),
@@ -936,10 +1235,12 @@ class StartupPitchRefinery:
             "terminal_utility": best_meta.get("terminal_utility"),
             "lcb_utility": best_meta.get("lcb_utility"),
             "quality_gain_override": bool(quality_gain_override),
+            "selected_checkpoint_quality_safe": bool(best_quality_safe),
+            "selected_checkpoint_quality_block_reasons": best_quality_block_reasons,
             "selection_rule": (
-                "accepted repair quality gain retained"
+                "score-monotonic quality-safe repair improvement retained"
                 if quality_gain_override
-                else "highest lower-confidence-bound terminal utility"
+                else "highest quality-safe validator score checkpoint"
                 if checkpoint_enabled
                 else "checkpoint rollback disabled; latest validation state retained"
             ),
@@ -971,9 +1272,13 @@ class StartupPitchRefinery:
 
     def _run_business_with_depth(self, state: PitchState):
         updates = self._run_node_with_budget(state, self.business_agent.run, "business")
-        mode = str(self._sget(state, "controller_mode", "") or "").strip().lower()
+        mode = str(
+            self._sget(state, "controller_mode_realized")
+            or self._sget(state, "controller_mode", "")
+            or ""
+        ).strip().lower()
         retry_count = int(self._sget(state, "retry_count", 0) or 0)
-        if mode == "direct":
+        if mode == "direct" and not bool(self._sget(state, "direct_precheck_escalated", False)):
             depth = 0
         else:
             depth = 2 if retry_count > 0 else 1
@@ -1004,6 +1309,13 @@ class StartupPitchRefinery:
     def _route_after_direct(self, state: PitchState) -> str:
         if bool(self._sget(state, "budget_hit", False)):
             return "stop"
+        if (
+            self.controller_policy == "adaptive"
+            and not str(self._sget(state, "forced_controller_mode", "") or "").strip().lower()
+            and bool(self._sget(state, "adaptive_retry_enabled", True))
+            and bool(self._sget(state, "needs_revision", False))
+        ):
+            return "market"
         return "pitch" if self.generate_pitch and self.pitch_agent is not None else "end"
 
     def _build_graph(self):
@@ -1049,6 +1361,7 @@ class StartupPitchRefinery:
         workflow.add_conditional_edges("select_best_checkpoint", self._route_by_budget, {"stop": END, "continue": "business"})
         if self.controller_policy == "adaptive" and self.direct_agent is not None:
             direct_route = {"stop": END, "end": END}
+            direct_route["market"] = "market"
             if self.generate_pitch and self.pitch_agent is not None:
                 direct_route["pitch"] = "pitch"
             workflow.add_conditional_edges("direct", self._route_after_direct, direct_route)

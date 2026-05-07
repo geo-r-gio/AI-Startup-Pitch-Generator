@@ -287,8 +287,11 @@ def _claim_repair_category(claim_text: str) -> str:
     gap_markers = ["gap", "opportunity", "underserved", "differentiation", "white space", "lack", "limited", "specific"]
     competitor_markers = ["competitor", "competitors", "platforms", "vendors", "solutions", "players", "offerings"]
     trend_markers = ["trend", "adoption", "increasing", "demand", "shift", "predictive", "automation", "real-time"]
+    regulatory_markers = ["hipaa", "compliance", "regulatory", "regulation", "audit", "privacy", "security", "authorization"]
     if any(m in text for m in numeric_markers):
         return "market_size_or_numeric"
+    if any(m in text for m in regulatory_markers):
+        return "regulatory_or_compliance"
     if any(m in text for m in competitor_markers):
         return "competitor_landscape"
     if any(m in text for m in trend_markers):
@@ -303,6 +306,8 @@ def _claim_materiality(claim_text: str, category: str | None = None) -> int:
     category = category or _claim_repair_category(text)
     materiality = 2
     if category == "market_size_or_numeric":
+        materiality = 5
+    elif category == "regulatory_or_compliance":
         materiality = 5
     elif category in {"competitor_landscape", "trend_or_adoption"}:
         materiality = 4
@@ -337,6 +342,8 @@ def _claim_failure_type(claim: Dict[str, Any], evidence_gaps: str = "") -> str:
 
 def _repair_action_for_claim(claim: Dict[str, Any]) -> str:
     """Choose the cheapest safe repair action for a weak claim."""
+    if bool(claim.get("coverage_enhancement")) or str(claim.get("failure_type", "")).strip() == "coverage_gap":
+        return "coverage_addition"
     claim_text = str(claim.get("claim", "") or claim.get("claim_text", "") or "")
     text = claim_text.lower()
     verdict = str(claim.get("verdict", "") or "").strip().lower()
@@ -348,6 +355,8 @@ def _repair_action_for_claim(claim: Dict[str, Any]) -> str:
     competitor_markers = ["competitor", "competitors", "vendors", "platforms", "solutions", "offerings"]
     is_negative_competitor_gap = any(m in text for m in negative_capability_markers) and any(m in text for m in competitor_markers + ["solution", "solutions", "platform", "platforms"])
     is_speculative_gap = category == "gap_or_opportunity" or any(m in text for m in speculative_markers)
+    if category in {"market_size_or_numeric", "regulatory_or_compliance"}:
+        return "search_and_replace"
     if verdict == "unsupported" and not supporting_sources:
         return "qualify_or_remove" if (is_negative_competitor_gap or is_speculative_gap) else "remove"
     if any(m in text for m in numeric_markers):
@@ -370,12 +379,18 @@ def build_claim_repair_plan(claims: List[Dict[str, Any]]) -> List[Dict[str, Any]
         claim_text = str(claim.get("claim") or claim.get("claim_text") or "").strip()
         if not claim_text:
             continue
-        category = _claim_repair_category(claim_text)
+        category = str(claim.get("category") or _claim_repair_category(claim_text))
         action = _repair_action_for_claim(claim)
         materiality = int(claim.get("materiality") or _claim_materiality(claim_text, category))
         failure_type = str(claim.get("failure_type") or claim.get("failure_type_hint") or _claim_failure_type(claim))
         if action == "search_and_replace":
             instruction = "Search for direct evidence, then replace only if the evidence supports the revised wording."
+        elif action == "coverage_addition":
+            target_add_count = min(max(1, int(claim.get("target_add_count") or claim.get("missing_claim_count") or 1)), 2)
+            instruction = (
+                f"Add {target_add_count} concise, source-backed coverage claim(s). "
+                "Do not remove or rewrite existing supported claims."
+            )
         elif action == "remove":
             instruction = "Remove this unsupported claim; do not replace it with a broader speculative claim."
         else:
@@ -393,6 +408,10 @@ def build_claim_repair_plan(claims: List[Dict[str, Any]]) -> List[Dict[str, Any]
             "instruction": instruction,
             "supporting_sources": claim.get("supporting_sources", []),
             "rationale": str(claim.get("rationale", "") or "")[:300],
+            "coverage_enhancement": bool(claim.get("coverage_enhancement", False)),
+            "missing_claim_count": int(claim.get("missing_claim_count", 0) or 0),
+            "claims_total_before_repair": int(claim.get("claims_total_before_repair", 0) or 0),
+            "target_add_count": min(max(1, int(claim.get("target_add_count") or claim.get("missing_claim_count") or 1)), 2),
             "candidate_queries": claim.get("candidate_queries", []) or [
                 f"{claim_text} evidence source",
                 f"{category.replace('_', ' ')} market evidence",
@@ -420,15 +439,24 @@ def _source_bound_replacement_ready(
     high_quality_sources: int,
     overlap_score: float,
 ) -> bool:
+    category_key = str(category or "").strip()
+    if category_key not in {"market_size_or_numeric", "regulatory_or_compliance"}:
+        return False
     if int(unique_sources or 0) < 2:
         return False
     if int(high_quality_sources or 0) < 1:
         return False
-    if float(overlap_score or 0.0) < 0.12:
+    materiality_int = int(materiality or 0)
+    overlap = float(overlap_score or 0.0)
+    retrieval = float(retrieval_score or 0.0)
+    high_quality = int(high_quality_sources or 0)
+    if overlap < 0.12:
         return False
-    if float(retrieval_score or 0.0) < 0.75:
+    if materiality_int >= 5 and high_quality >= 2 and overlap >= 0.18 and retrieval >= 0.65:
+        return True
+    if retrieval < 0.75:
         return False
-    return str(category or "").strip() == "market_size_or_numeric" or int(materiality or 0) >= 4
+    return materiality_int >= 5
 
 
 class RefinedIdea(BaseModel):
@@ -529,10 +557,11 @@ class SecondJudgeOutput(BaseModel):
 
 class ClaimPatchOutput(BaseModel):
     original_claim: str
-    action: Literal["search_and_replace", "qualify_or_remove", "remove", "preserve"]
+    action: Literal["search_and_replace", "coverage_addition", "qualify_or_remove", "remove", "preserve"]
     replacement: str
     expected_reliability_effect: Literal[
         "improve_to_supported",
+        "add_source_backed_claim",
         "reduce_to_conservative_claim",
         "remove_unsupported_claim",
         "no_change",
@@ -559,9 +588,13 @@ class RetrievalDiagnostic(BaseModel):
     claim_id: str
     claim: str
     category: str
-    action: Literal["search_and_replace", "qualify_or_remove", "remove", "preserve"]
+    action: Literal["search_and_replace", "coverage_addition", "qualify_or_remove", "remove", "preserve"]
     failure_type: str
     materiality: int = Field(..., ge=1, le=5)
+    coverage_enhancement: bool = False
+    target_add_count: int = 1
+    missing_claim_count: int = 0
+    claims_total_before_repair: int = 0
     retrieval_score: float = Field(..., ge=0.0, le=1.0)
     unique_sources: int = 0
     high_quality_sources: int = 0
@@ -578,7 +611,7 @@ class RetrievalDiagnostic(BaseModel):
 class RetryPolicyDecision(BaseModel):
     action: Literal["stop", "repair_bundle", "broad_retry"]
     selected_claim_ids: List[str] = Field(default_factory=list)
-    action_type: Optional[Literal["search_and_replace", "qualify_or_remove", "remove"]] = None
+    action_type: Optional[Literal["search_and_replace", "coverage_addition", "qualify_or_remove", "remove"]] = None
     posterior_acceptance: float = Field(default=0.0, ge=0.0, le=1.0)
     expected_gain: float = 0.0
     expected_tokens: int = 0
@@ -608,12 +641,46 @@ class BayesianRetryPolicy:
         "max_bundle_claims": 1,
         "max_repair_rounds": 1,
         "tail_token_reserve": 3500,
+        "min_remaining_tokens_for_repair": 4000,
+        "threshold_crossing_margin": 1.0,
+        "large_deficit_repair_min_deficit": 10.0,
+        "large_deficit_repair_min_materiality": 5.0,
+        "large_deficit_repair_min_retrieval": 0.75,
+        "large_deficit_repair_min_expected_gain": 5.0,
+        "large_deficit_repair_min_expected_utility": 1.0,
+        "large_deficit_repair_min_roi": 1.25,
+        "large_deficit_repair_min_unique_sources": 2.0,
+        "large_deficit_repair_min_high_quality_sources": 2.0,
+        "large_deficit_repair_reserve_slack_tokens": 1000.0,
+        "threshold_crossing_repair_min_materiality": 5.0,
+        "threshold_crossing_repair_min_retrieval": 0.75,
+        "threshold_crossing_repair_min_expected_utility": 1.0,
+        "threshold_crossing_repair_min_roi": 1.25,
+        "threshold_crossing_repair_min_unique_sources": 2.0,
+        "threshold_crossing_repair_min_high_quality_sources": 2.0,
+        "threshold_crossing_repair_reserve_slack_tokens": 1000.0,
+        "source_backed_material_repair_min_materiality": 5.0,
+        "source_backed_material_repair_min_retrieval": 0.65,
+        "source_backed_material_repair_min_overlap": 0.18,
+        "source_backed_material_repair_min_expected_utility": -0.25,
+        "source_backed_material_repair_min_roi": 0.60,
+        "source_backed_material_repair_min_unique_sources": 2.0,
+        "source_backed_material_repair_min_high_quality_sources": 2.0,
+        "source_backed_material_repair_reserve_slack_tokens": 1800.0,
+        "coverage_addition_min_retrieval": 0.60,
+        "coverage_addition_min_unique_sources": 2.0,
+        "coverage_addition_min_high_quality_sources": 1.0,
+        "coverage_addition_min_high_quality_sources_regulated": 2.0,
+        "coverage_addition_reserve_slack_tokens": 1800.0,
     }
     DEFAULT_WEIGHTS: Dict[str, float] = {
         "lambda_tok": 0.50,
         "lambda_time": 0.03,
         "lambda_crit": 4.00,
         "ucb_exploration": 0.15,
+        "gain_kappa": 2.0,
+        "token_kappa": 3.0,
+        "seconds_kappa": 5.0,
     }
     DEFAULT_PRIORS: Dict[str, Dict[str, float]] = {
         "qualify_or_remove": {"alpha": 3.0, "beta": 4.0, "gain": 1.5, "tokens": 2800.0, "seconds": 15.0},
@@ -621,6 +688,7 @@ class BayesianRetryPolicy:
         "search_and_replace_strong": {"alpha": 4.0, "beta": 3.0, "gain": 4.0, "tokens": 3000.0, "seconds": 19.0},
         "search_and_replace_medium": {"alpha": 3.0, "beta": 4.0, "gain": 3.0, "tokens": 4000.0, "seconds": 21.0},
         "search_and_replace_weak": {"alpha": 1.0, "beta": 5.0, "gain": 1.0, "tokens": 4500.0, "seconds": 23.0},
+        "coverage_addition": {"alpha": 4.0, "beta": 3.0, "gain": 5.0, "tokens": 4200.0, "seconds": 18.0},
         "broad_retry": {"alpha": 2.0, "beta": 5.0, "gain": 5.0, "tokens": 9500.0, "seconds": 36.0},
     }
 
@@ -669,6 +737,8 @@ class BayesianRetryPolicy:
         scoring_action = str(action or diag.action or "").strip()
         if scoring_action == "search_and_replace":
             base = f"search_and_replace_{_retrieval_bucket(diag.retrieval_score)}"
+        elif scoring_action == "coverage_addition":
+            base = "coverage_addition"
         elif scoring_action == "remove":
             base = "remove"
         else:
@@ -716,7 +786,7 @@ class BayesianRetryPolicy:
             guard_reasons.append("no_high_quality_source_for_replacement")
         if float(diag.overlap_score or 0.0) < 0.12:
             guard_reasons.append("low_claim_evidence_overlap")
-        if float(diag.retrieval_score or 0.0) < 0.75:
+        if float(diag.retrieval_score or 0.0) < 0.75 and not source_ready:
             guard_reasons.append("retrieval_score_below_source_bound_threshold")
         if guard_reasons:
             return "qualify_or_remove", guard_reasons
@@ -741,18 +811,26 @@ class BayesianRetryPolicy:
         ucb_bonus = min(0.20, float(self.weights["ucb_exploration"]) * raw_ucb_bonus)
         p_accept = min(1.0, p_mean + ucb_bonus)
         n = n_empirical
-        kappa = 5.0
+        gain_kappa = max(0.0, _safe_float(self.weights.get("gain_kappa", 2.0), 2.0))
+        token_kappa = max(0.0, _safe_float(self.weights.get("token_kappa", 3.0), 3.0))
+        seconds_kappa = max(0.0, _safe_float(self.weights.get("seconds_kappa", 5.0), 5.0))
         obs_gain = _safe_float(observed.get("mean_gain", prior["gain"]), prior["gain"])
         obs_tokens = _safe_float(observed.get("mean_tokens", prior["tokens"]), prior["tokens"])
         obs_seconds = _safe_float(observed.get("mean_seconds", prior["seconds"]), prior["seconds"])
+        expected_gain = (gain_kappa * prior["gain"] + n * obs_gain) / max(1e-6, gain_kappa + n)
+        expected_tokens = (token_kappa * prior["tokens"] + n * obs_tokens) / max(1e-6, token_kappa + n)
+        expected_seconds = (seconds_kappa * prior["seconds"] + n * obs_seconds) / max(1e-6, seconds_kappa + n)
         return {
             "posterior_acceptance": round(p_accept, 4),
             "posterior_mean": round(p_mean, 4),
             "ucb_bonus": round(ucb_bonus, 4),
             "n_empirical": round(n_empirical, 4),
-            "expected_gain": round((kappa * prior["gain"] + n * obs_gain) / (kappa + n), 4),
-            "expected_tokens": round((kappa * prior["tokens"] + n * obs_tokens) / (kappa + n), 4),
-            "expected_seconds": round((kappa * prior["seconds"] + n * obs_seconds) / (kappa + n), 4),
+            "expected_gain": round(expected_gain, 4),
+            "expected_tokens": round(expected_tokens, 4),
+            "expected_seconds": round(expected_seconds, 4),
+            "gain_kappa": round(gain_kappa, 4),
+            "token_kappa": round(token_kappa, 4),
+            "seconds_kappa": round(seconds_kappa, 4),
             "p_critical_degradation": round(_safe_float(observed.get("critical_degradation_rate", 0.05), 0.05), 4),
         }
 
@@ -761,9 +839,40 @@ class BayesianRetryPolicy:
         prefilter_reasons: List[str] = []
         if diag.action == "preserve":
             return None
-        effective_action, guard_reasons = self._guard_adjusted_action(diag)
+        is_coverage_addition = bool(
+            diag.action == "coverage_addition"
+            or diag.failure_type == "coverage_gap"
+            or diag.coverage_enhancement
+            or str(diag.claim_id).startswith("coverage_gap")
+        )
+        if is_coverage_addition:
+            effective_action = "coverage_addition"
+            guard_reasons: List[str] = []
+        else:
+            effective_action, guard_reasons = self._guard_adjusted_action(diag)
+        if effective_action in {"qualify_or_remove", "remove"}:
+            prefilter_reasons.append("blocked_by_non_improvement_action")
         if effective_action == "search_and_replace" and diag.retrieval_score < retrieval_min:
             prefilter_reasons.append("blocked_by_retrieval_quality")
+        if effective_action == "coverage_addition":
+            coverage_min_retrieval = float(self.thresholds.get("coverage_addition_min_retrieval", 0.60) or 0.60)
+            coverage_min_sources = int(self.thresholds.get("coverage_addition_min_unique_sources", 2.0) or 2.0)
+            regulated_category = diag.category in {"regulatory_or_compliance"}
+            coverage_min_hq = int(
+                self.thresholds.get(
+                    "coverage_addition_min_high_quality_sources_regulated"
+                    if regulated_category
+                    else "coverage_addition_min_high_quality_sources",
+                    1.0,
+                )
+                or 1.0
+            )
+            if diag.retrieval_score < coverage_min_retrieval:
+                prefilter_reasons.append("blocked_by_coverage_retrieval_quality")
+            if int(diag.unique_sources or 0) < coverage_min_sources:
+                prefilter_reasons.append("blocked_by_coverage_unique_sources")
+            if int(diag.high_quality_sources or 0) < coverage_min_hq:
+                prefilter_reasons.append("blocked_by_coverage_high_quality_sources")
         if effective_action in {"qualify_or_remove", "remove"} and diag.retrieval_score < 0.20 and diag.materiality < 4:
             prefilter_reasons.append("blocked_by_low_retrieval_low_materiality")
         policy_stats = _sget(state, "policy_stats", {}) or {}
@@ -772,7 +881,20 @@ class BayesianRetryPolicy:
         score_deficit = max(0.0, float(threshold - current_score))
         if effective_action in {"qualify_or_remove", "remove"} and diag.unique_sources == 0 and score_deficit < 8.0:
             prefilter_reasons.append("blocked_by_low_deficit_no_sources")
-        expected_gain = min(12.0, vals["expected_gain"] + 0.35 * max(0, diag.materiality - 2) + 1.0 * max(0.0, diag.retrieval_score - 0.55) + 0.12 * score_deficit)
+        if effective_action == "coverage_addition":
+            target_add_count = min(max(1, int(diag.target_add_count or diag.missing_claim_count or 1)), 2)
+            missing_claim_count = max(0, int(diag.missing_claim_count or 0))
+            coverage_bonus = (
+                1.50 * target_add_count
+                + 0.70 * min(2, missing_claim_count)
+                + 1.00 * max(0.0, diag.retrieval_score - 0.60)
+                + 0.05 * score_deficit
+            )
+            expected_gain = min(9.0, vals["expected_gain"] + coverage_bonus)
+        else:
+            target_add_count = 0
+            missing_claim_count = 0
+            expected_gain = min(12.0, vals["expected_gain"] + 0.35 * max(0, diag.materiality - 2) + 1.0 * max(0.0, diag.retrieval_score - 0.55) + 0.12 * score_deficit)
         if diag.action == "search_and_replace" and effective_action != "search_and_replace":
             expected_gain = min(expected_gain, 2.5)
         expected_tokens = vals["expected_tokens"]
@@ -780,6 +902,52 @@ class BayesianRetryPolicy:
         p_accept = vals["posterior_acceptance"]
         eu = p_accept * max(0.0, expected_gain) - float(self.weights["lambda_tok"]) * (expected_tokens / 1000.0) - float(self.weights["lambda_time"]) * expected_seconds - float(self.weights["lambda_crit"]) * vals["p_critical_degradation"]
         roi = (p_accept * max(0.0, expected_gain)) / max(1e-6, expected_tokens / 1000.0)
+        projected_score_after = float(current_score) + float(expected_gain)
+        threshold_crossing_margin = float(self.thresholds.get("threshold_crossing_margin", 1.0) or 0.0)
+        threshold_crossing_required = bool(effective_action == "search_and_replace" and score_deficit > 0.0)
+        large_deficit_incremental_exception = bool(
+            threshold_crossing_required
+            and score_deficit >= float(self.thresholds.get("large_deficit_repair_min_deficit", 10.0) or 10.0)
+            and int(diag.materiality or 0) >= int(self.thresholds.get("large_deficit_repair_min_materiality", 5.0) or 5.0)
+            and float(diag.retrieval_score or 0.0) >= float(self.thresholds.get("large_deficit_repair_min_retrieval", 0.75) or 0.75)
+            and int(diag.unique_sources or 0) >= int(self.thresholds.get("large_deficit_repair_min_unique_sources", 2.0) or 2.0)
+            and int(diag.high_quality_sources or 0) >= int(self.thresholds.get("large_deficit_repair_min_high_quality_sources", 2.0) or 2.0)
+            and expected_gain >= float(self.thresholds.get("large_deficit_repair_min_expected_gain", 5.0) or 5.0)
+            and eu >= float(self.thresholds.get("large_deficit_repair_min_expected_utility", 1.0) or 1.0)
+            and roi >= float(self.thresholds.get("large_deficit_repair_min_roi", self.thresholds.get("roi_min", 1.25)) or 1.25)
+            and not guard_reasons
+        )
+        threshold_crossing_met = bool(projected_score_after >= float(threshold) - threshold_crossing_margin)
+        threshold_crossing_repair_exception = bool(
+            threshold_crossing_required
+            and threshold_crossing_met
+            and int(diag.materiality or 0) >= int(self.thresholds.get("threshold_crossing_repair_min_materiality", 5.0) or 5.0)
+            and float(diag.retrieval_score or 0.0) >= float(self.thresholds.get("threshold_crossing_repair_min_retrieval", 0.75) or 0.75)
+            and int(diag.unique_sources or 0) >= int(self.thresholds.get("threshold_crossing_repair_min_unique_sources", 2.0) or 2.0)
+            and int(diag.high_quality_sources or 0) >= int(self.thresholds.get("threshold_crossing_repair_min_high_quality_sources", 2.0) or 2.0)
+            and eu >= float(self.thresholds.get("threshold_crossing_repair_min_expected_utility", 1.0) or 1.0)
+            and roi >= float(self.thresholds.get("threshold_crossing_repair_min_roi", self.thresholds.get("roi_min", 1.25)) or 1.25)
+            and not guard_reasons
+        )
+        source_backed_material_repair_exception = bool(
+            threshold_crossing_required
+            and threshold_crossing_met
+            and diag.category in {"market_size_or_numeric", "regulatory_or_compliance"}
+            and int(diag.materiality or 0) >= int(self.thresholds.get("source_backed_material_repair_min_materiality", 5.0) or 5.0)
+            and float(diag.retrieval_score or 0.0) >= float(self.thresholds.get("source_backed_material_repair_min_retrieval", 0.65) or 0.65)
+            and float(diag.overlap_score or 0.0) >= float(self.thresholds.get("source_backed_material_repair_min_overlap", 0.18) or 0.18)
+            and int(diag.unique_sources or 0) >= int(self.thresholds.get("source_backed_material_repair_min_unique_sources", 2.0) or 2.0)
+            and int(diag.high_quality_sources or 0) >= int(self.thresholds.get("source_backed_material_repair_min_high_quality_sources", 2.0) or 2.0)
+            and eu >= float(self.thresholds.get("source_backed_material_repair_min_expected_utility", -0.10) or -0.10)
+            and roi >= float(self.thresholds.get("source_backed_material_repair_min_roi", 0.70) or 0.70)
+            and not guard_reasons
+        )
+        coverage_addition_exception = bool(
+            effective_action == "coverage_addition"
+            and not prefilter_reasons
+            and missing_claim_count > 0
+            and target_add_count > 0
+        )
         return {
             "claim_id": diag.claim_id,
             "action_type": effective_action,
@@ -797,7 +965,23 @@ class BayesianRetryPolicy:
             "expected_seconds": round(expected_seconds, 4),
             "expected_utility": round(eu, 4),
             "roi_per_1k": round(roi, 4),
+            "score_deficit": round(score_deficit, 4),
+            "projected_score_after": round(projected_score_after, 4),
+            "threshold_crossing_required": 1 if threshold_crossing_required else 0,
+            "threshold_crossing_met": 1 if threshold_crossing_met else 0,
+            "threshold_crossing_margin": round(threshold_crossing_margin, 4),
+            "threshold_crossing_exception": 0,
+            "threshold_crossing_repair_exception": 1 if threshold_crossing_repair_exception else 0,
+            "source_backed_material_repair_exception": 1 if source_backed_material_repair_exception else 0,
+            "large_deficit_incremental_exception": 1 if large_deficit_incremental_exception else 0,
+            "coverage_addition_exception": 1 if coverage_addition_exception else 0,
+            "target_add_count": int(target_add_count),
+            "missing_claim_count": int(missing_claim_count),
+            "claims_total_before_repair": int(diag.claims_total_before_repair or 0),
             "retrieval_score": round(diag.retrieval_score, 4),
+            "unique_sources": int(diag.unique_sources or 0),
+            "high_quality_sources": int(diag.high_quality_sources or 0),
+            "overlap_score": round(float(diag.overlap_score or 0.0), 4),
             "materiality": diag.materiality,
             "category": diag.category,
             "failure_type": diag.failure_type,
@@ -826,16 +1010,14 @@ class BayesianRetryPolicy:
             if cand is None:
                 continue
             blocking_gates = list(cand.get("blocking_gates", []) or [])
+            source_backed_material_exception = bool(cand.get("source_backed_material_repair_exception"))
+            coverage_addition_exception = bool(cand.get("coverage_addition_exception"))
             if cand["posterior_acceptance"] < float(self.thresholds["posterior_accept_min"]):
                 blocking_gates.append("blocked_by_posterior_acceptance")
-            if cand["roi_per_1k"] < float(self.thresholds["roi_min"]):
-                blocking_gates.append("blocked_by_roi")
-            if cand["expected_utility"] <= float(self.thresholds["eu_margin"]):
-                blocking_gates.append("blocked_by_expected_utility")
             if isinstance(remaining_tokens, int):
-                reserve = int(self.thresholds["tail_token_reserve"])
-                if remaining_tokens - int(cand["expected_tokens"]) < reserve:
-                    blocking_gates.append("blocked_by_token_reserve")
+                min_remaining = int(float(self.thresholds.get("min_remaining_tokens_for_repair", 4000) or 4000))
+                if remaining_tokens < min_remaining:
+                    blocking_gates.append("blocked_by_insufficient_repair_budget")
             cand["blocking_gates"] = blocking_gates
             cand["gate_result"] = "blocked" if blocking_gates else "passed"
             evaluated_candidates.append(cand)
@@ -843,7 +1025,19 @@ class BayesianRetryPolicy:
                 rejected_candidates.append(cand)
             else:
                 candidates.append(cand)
-        candidates = sorted(candidates, key=lambda c: (float(c["expected_utility"]), int(c["materiality"]), float(c["retrieval_score"])), reverse=True)
+        candidates = sorted(
+            candidates,
+            key=lambda c: (
+                int(bool(c.get("coverage_addition_exception"))),
+                float(c.get("retrieval_score", 0.0) or 0.0),
+                int(c.get("high_quality_sources", 0) or 0),
+                int(c.get("unique_sources", 0) or 0),
+                int(c.get("materiality", 0) or 0),
+                float(c.get("posterior_acceptance", 0.0) or 0.0),
+                float(c.get("expected_gain", 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
         selected = candidates[: max(1, int(self.thresholds["max_bundle_claims"]))]
         block_reason_counts: Dict[str, int] = {}
         for cand in rejected_candidates:
@@ -857,7 +1051,7 @@ class BayesianRetryPolicy:
             )
         ]
         if not selected:
-            reason = "no_positive_expected_utility_repair"
+            reason = "no_evidence_gated_repair_candidate"
             return RetryPolicyDecision(
                 action="stop",
                 current_score=current_score,
@@ -873,6 +1067,16 @@ class BayesianRetryPolicy:
                 rejected_candidates=rejected_candidates,
             )
         best = selected[0]
+        if any(bool(c.get("coverage_addition_exception")) for c in selected):
+            selected_reason = "coverage_addition_selected"
+        elif any(bool(c.get("source_backed_material_repair_exception")) for c in selected):
+            selected_reason = "source_backed_material_repair_selected"
+        elif any(bool(c.get("threshold_crossing_repair_exception")) for c in selected):
+            selected_reason = "threshold_crossing_repair_selected"
+        elif any(bool(c.get("large_deficit_incremental_exception")) for c in selected):
+            selected_reason = "large_deficit_incremental_repair_selected"
+        else:
+            selected_reason = "evidence_gated_repair_selected"
         return RetryPolicyDecision(
             action="repair_bundle",
             selected_claim_ids=[str(c["claim_id"]) for c in selected],
@@ -890,7 +1094,7 @@ class BayesianRetryPolicy:
             evaluated_candidate_count=len(evaluated_candidates),
             viable_candidate_count=len(candidates),
             rejected_candidate_count=len(rejected_candidates),
-            reason="positive_expected_utility_repair_selected",
+            reason=selected_reason,
             block_reasons=[],
             rejected_candidate_block_reasons=rejected_candidate_block_reasons,
             candidates=evaluated_candidates,
@@ -2122,6 +2326,7 @@ class AdaptiveControllerAgent:
         return {
             "controller_mode": chosen_mode_final,
             "controller_mode_initial": chosen_mode_initial,
+            "controller_mode_realized": chosen_mode_final,
             "controller_budget_override": budget_override,
             "controller_confidence": decision.confidence,
             "controller_rationale": decision.rationale,
@@ -2334,9 +2539,12 @@ class ClaimRepairAgent:
                     "- Do not rewrite the whole market analysis.\n"
                     "- Preserve supported claims unless directly contradicted.\n"
                     "- Repair only the listed weak/unsupported claims.\n"
-                    "- Treat the repair plan action as binding. If action=qualify_or_remove, do not convert it into a stronger factual claim.\n"
-                    "- For guarded_action=qualify_or_remove, narrow the original claim into a cautious limitation, hypothesis, or remove it from factual sections.\n"
+                    "- The adaptive controller only benefits from source-backed improvements: prefer coverage_addition or search_and_replace patches that can raise validator score.\n"
+                    "- For action=coverage_addition, append target_add_count concise source-backed market-analysis claims that improve missing coverage or specificity; preserve the existing supported claims.\n"
+                    "- Treat action=coverage_addition as additive: do not remove, soften, or replace existing supported claims while adding coverage.\n"
+                    "- For action=qualify_or_remove or action=remove, make the smallest safe edit only if the plan still contains enough source-backed claims; otherwise preserve the checkpoint by making no substantive change.\n"
                     "- For action=search_and_replace, every replacement must be a direct paraphrase of the focused snippets and must include supporting evidence URLs in the patch.\n"
+                    "- For action=coverage_addition, every added claim must cite at least one focused evidence URL in the patch.\n"
                     "- If evidence is weak, qualify or remove the claim instead of making it sound stronger.\n"
                     "- Do not add new market-size, CAGR, adoption-rate, or competitor claims unless directly supported by focused snippets.\n"
                     "- Do not introduce numbers, named competitors, adoption rates, compliance claims, or market forecasts that are absent from the provided snippets.\n"
@@ -2363,7 +2571,7 @@ class ClaimRepairAgent:
     def _queries_for_plan(plan: List[Dict[str, Any]]) -> List[str]:
         queries: List[str] = []
         for item in plan:
-            if item.get("action") != "search_and_replace":
+            if item.get("action") not in {"search_and_replace", "coverage_addition"}:
                 continue
             candidates = item.get("candidate_queries") or []
             q = str(candidates[0]).strip() if candidates else f"{item.get('claim', '')} evidence source"
@@ -2382,6 +2590,11 @@ class ClaimRepairAgent:
             item = dict(raw_item)
             requested_action = str(item.get("action") or "qualify_or_remove").strip()
             item["requested_action"] = requested_action
+            if requested_action == "coverage_addition":
+                item["guarded_action"] = "coverage_addition"
+                item.setdefault("guard_reason", "coverage_addition_source_search_allowed")
+                guarded.append(item)
+                continue
             if requested_action != "search_and_replace":
                 item["guarded_action"] = requested_action
                 item.setdefault("guard_reason", "already_conservative_action")
@@ -2416,7 +2629,7 @@ class ClaimRepairAgent:
                 guard_reasons.append("no_high_quality_source_for_replacement")
             if overlap_score < 0.12:
                 guard_reasons.append("low_claim_evidence_overlap")
-            if retrieval_score < 0.75:
+            if retrieval_score < 0.75 and not source_ready:
                 guard_reasons.append("retrieval_score_below_source_bound_threshold")
 
             if guard_reasons:
@@ -2474,11 +2687,11 @@ class ClaimRepairAgent:
             retrieval_score = round(0.35 * min(1.0, unique_sources / 3.0) + 0.25 * min(1.0, high_quality_sources / 2.0) + 0.20 * max(0.0, min(1.0, overlap)) + 0.10 * max(0.0, min(1.0, domain_diversity)) + 0.10 * max(0.0, min(1.0, mean_quality)), 4)
         strength = "strong" if retrieval_score >= 0.70 else ("medium" if retrieval_score >= 0.55 else ("weak" if retrieval_score > 0 else "none"))
         reasons: List[str] = []
-        if unique_sources < 2 and action == "search_and_replace":
+        if unique_sources < 2 and action in {"search_and_replace", "coverage_addition"}:
             reasons.append("fewer_than_two_unique_sources")
-        if high_quality_sources == 0 and action == "search_and_replace":
+        if high_quality_sources == 0 and action in {"search_and_replace", "coverage_addition"}:
             reasons.append("no_high_quality_source")
-        if overlap < 0.10 and action == "search_and_replace":
+        if overlap < 0.10 and action in {"search_and_replace", "coverage_addition"}:
             reasons.append("low_claim_snippet_overlap")
         probe_status = str(plan_item.get("evidence_probe_status", "") or "").strip()
         if probe_status:
@@ -2487,9 +2700,13 @@ class ClaimRepairAgent:
             claim_id=str(plan_item.get("claim_id") or ""),
             claim=claim_text,
             category=str(plan_item.get("category") or _claim_repair_category(claim_text)),
-            action=action if action in {"search_and_replace", "qualify_or_remove", "remove", "preserve"} else "qualify_or_remove",  # type: ignore[arg-type]
+            action=action if action in {"search_and_replace", "coverage_addition", "qualify_or_remove", "remove", "preserve"} else "qualify_or_remove",  # type: ignore[arg-type]
             failure_type=str(plan_item.get("failure_type") or "missing_evidence"),
             materiality=int(plan_item.get("materiality", 1) or 1),
+            coverage_enhancement=bool(plan_item.get("coverage_enhancement", False)),
+            target_add_count=min(max(1, int(plan_item.get("target_add_count", 1) or 1)), 2),
+            missing_claim_count=max(0, int(plan_item.get("missing_claim_count", 0) or 0)),
+            claims_total_before_repair=max(0, int(plan_item.get("claims_total_before_repair", 0) or 0)),
             retrieval_score=max(0.0, min(1.0, retrieval_score)),
             unique_sources=unique_sources,
             high_quality_sources=high_quality_sources,
@@ -2509,7 +2726,7 @@ class ClaimRepairAgent:
         for item in plan:
             action = str(item.get("action", "qualify_or_remove"))
             payload: Dict[str, Any] = {"status": "skipped", "results": [], "sources": [], "queries": [], "error": "Conservative repair does not require focused retrieval."}
-            if action == "search_and_replace":
+            if action in {"search_and_replace", "coverage_addition"}:
                 queries = item.get("candidate_queries") or [f"{item.get('claim', '')} evidence source"]
                 queries = [str(q).strip() for q in queries if str(q).strip()][:2]
                 try:
@@ -2570,11 +2787,13 @@ class ClaimRepairAgent:
         selected_action_type = str(selected_action.get("action_type") or "").strip()
         if selected_claim_ids:
             plan = [p for p in plan if str(p.get("claim_id")) in selected_claim_ids]
-        if selected_action_type in {"search_and_replace", "qualify_or_remove", "remove"}:
+        if selected_action_type in {"search_and_replace", "coverage_addition", "qualify_or_remove", "remove"}:
             for item in plan:
                 item["policy_selected_action"] = selected_action_type
-                if selected_action_type in {"qualify_or_remove", "remove"}:
+                if selected_action_type in {"search_and_replace", "coverage_addition"}:
                     item["action"] = selected_action_type
+                elif selected_action_type in {"qualify_or_remove", "remove"}:
+                    item["policy_conservative_action_not_forced"] = True
         plan = plan[:3]
         diagnostics_raw = _sget(state, "retrieval_diagnostics", []) or repair_context.get("retrieval_diagnostics", []) or []
         diagnostics = [d if isinstance(d, dict) else d.model_dump() for d in diagnostics_raw]
@@ -2583,7 +2802,7 @@ class ClaimRepairAgent:
         queries = self._queries_for_plan(plan)
         focused_payload = {"status": "skipped", "results": [], "sources": [], "results_json": "[]", "error": "No search-based repair actions requested."}
         if queries:
-            claim_text = " ".join(str(item.get("claim", "")) for item in plan if item.get("action") == "search_and_replace")
+            claim_text = " ".join(str(item.get("claim", "")) for item in plan if item.get("action") in {"search_and_replace", "coverage_addition"})
             try:
                 focused_payload = self.search_tool.search_many(queries[:2], claim_text=claim_text, max_results_per_query=2)
             except AttributeError:
@@ -2601,7 +2820,7 @@ class ClaimRepairAgent:
         focused_payload = _limited_search_payload(focused_payload, max_items=4, content_chars=220)
         if plan and not diagnostic_map:
             for item in plan:
-                payload = focused_payload if item.get("action") == "search_and_replace" else {"status": "skipped", "results": [], "sources": [], "queries": [], "error": "Conservative repair does not require focused retrieval."}
+                payload = focused_payload if item.get("action") in {"search_and_replace", "coverage_addition"} else {"status": "skipped", "results": [], "sources": [], "queries": [], "error": "Conservative repair does not require focused retrieval."}
                 diagnostic_map[str(item.get("claim_id"))] = self._diagnostic_from_payload(plan_item=item, payload=payload).model_dump()
             plan = self._apply_source_bound_guards(plan, diagnostic_map)
         diagnostics_for_prompt = [diagnostic_map.get(str(item.get("claim_id")), {}) for item in plan]
@@ -2624,7 +2843,7 @@ class ClaimRepairAgent:
         tool_audit = list(_sget(state, "tool_audit", []))
         if queries:
             tool_audit.append({"agent": "claim_repair", "tool": "focused_repair_search", "status": focused_payload.get("status", "unknown"), "query": " | ".join(queries), "source_count": len(focused_payload.get("sources", [])), "source_count_raw": focused_payload.get("source_count_raw"), "high_quality_source_count": focused_payload.get("high_quality_source_count"), "mean_claim_overlap": focused_payload.get("mean_claim_overlap"), "error": focused_payload.get("error", "")})
-        action_counts = {"search_and_replace": sum(1 for item in plan if item.get("action") == "search_and_replace"), "qualify_or_remove": sum(1 for item in plan if item.get("action") == "qualify_or_remove"), "remove": sum(1 for item in plan if item.get("action") == "remove")}
+        action_counts = {"search_and_replace": sum(1 for item in plan if item.get("action") == "search_and_replace"), "coverage_addition": sum(1 for item in plan if item.get("action") == "coverage_addition"), "qualify_or_remove": sum(1 for item in plan if item.get("action") == "qualify_or_remove"), "remove": sum(1 for item in plan if item.get("action") == "remove")}
         tool_audit.append({"agent": "claim_repair", "tool": "claim_micro_repair", "status": "ok", "claim_count": len(plan), "source_count": len(focused_payload.get("sources", [])), "repair_action_counts": action_counts, "retrieval_diagnostics": diagnostics_for_prompt, "selected_action": selected_action, "patches": repair_patches, "prompt_tokens": usage.get("prompt_tokens", 0), "completion_tokens": usage.get("completion_tokens", 0), "total_tokens": usage.get("total_tokens", 0)})
         return {"market_analysis": market_analysis, "market_sources": _merge_unique(_sget(state, "market_sources", []) or [], focused_payload.get("sources", []) or []), "market_evidence": merged_evidence, "repair_plan": plan, "repair_patches": repair_patches, "retrieval_diagnostics": list(diagnostic_map.values()), "tool_audit": tool_audit, "token_usage": token_usage}
 

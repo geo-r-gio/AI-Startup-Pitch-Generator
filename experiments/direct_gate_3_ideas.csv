@@ -1,0 +1,4 @@
+idea_id,difficulty,domain,idea
+simple_001,easy,consumer,"A mobile app that helps college students organize study groups, track study sessions, and send simple reminders to friends."
+medium_001,medium,ecommerce,"An AI assistant for small Shopify stores that analyzes abandoned carts, suggests personalized discount campaigns, and summarizes weekly conversion trends."
+hard_001,hard,healthcare,"HIPAA-compliant AI workflow automation for specialty clinics that reduces insurance pre-authorization delays, integrates with EHR systems, and validates regulatory evidence."

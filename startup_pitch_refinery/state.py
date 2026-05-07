@@ -11,6 +11,21 @@ class PitchState(BaseModel):
     forced_controller_mode: Optional[str] = None
     controller_mode: Optional[str] = None
     controller_mode_initial: Optional[str] = None
+    controller_mode_realized: Optional[str] = None
+    controller_escalated: bool = False
+    controller_escalation_reason: Optional[str] = None
+    direct_precheck_allowed: bool = False
+    direct_precheck_skipped: bool = False
+    direct_precheck_escalated: bool = False
+    direct_precheck_accepted: bool = False
+    direct_precheck_score: int = 0
+    direct_precheck_incremental_tokens: int = 0
+    direct_precheck_gate_bucket: Optional[str] = None
+    direct_precheck_gate_reason: Optional[str] = None
+    direct_precheck_gate_block_reasons: List[str] = Field(default_factory=list)
+    direct_precheck_gate_probability: float = 0.0
+    direct_precheck_gate_threshold: float = 0.0
+    direct_precheck_gate_expected_net_tokens: float = 0.0
     controller_budget_override: bool = False
     controller_confidence: Optional[float] = None
     controller_rationale: Optional[str] = None
@@ -32,6 +47,24 @@ class PitchState(BaseModel):
             "max_bundle_claims": 1.0,
             "max_repair_rounds": 1.0,
             "tail_token_reserve": 3500.0,
+            "min_remaining_tokens_for_repair": 4000.0,
+            "threshold_crossing_margin": 1.0,
+            "large_deficit_repair_min_deficit": 10.0,
+            "large_deficit_repair_min_materiality": 5.0,
+            "large_deficit_repair_min_retrieval": 0.75,
+            "large_deficit_repair_min_expected_gain": 5.0,
+            "large_deficit_repair_min_expected_utility": 1.0,
+            "large_deficit_repair_min_roi": 1.25,
+            "large_deficit_repair_min_unique_sources": 2.0,
+            "large_deficit_repair_min_high_quality_sources": 2.0,
+            "large_deficit_repair_reserve_slack_tokens": 1000.0,
+            "threshold_crossing_repair_min_materiality": 5.0,
+            "threshold_crossing_repair_min_retrieval": 0.75,
+            "threshold_crossing_repair_min_expected_utility": 1.0,
+            "threshold_crossing_repair_min_roi": 1.25,
+            "threshold_crossing_repair_min_unique_sources": 2.0,
+            "threshold_crossing_repair_min_high_quality_sources": 2.0,
+            "threshold_crossing_repair_reserve_slack_tokens": 1000.0,
         }
     )
     utility_weights: Dict[str, float] = Field(
@@ -42,6 +75,9 @@ class PitchState(BaseModel):
             "lambda_low": 6.0,
             "z_uncertainty": 1.0,
             "repair_success_margin": 1.0,
+            "gain_kappa": 2.0,
+            "token_kappa": 3.0,
+            "seconds_kappa": 5.0,
         }
     )
 
